@@ -25,3 +25,10 @@ CONFIG_LV_FONT_MONTSERRAT_18=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_26=y
 CONFIG_LV_USE_FONT_COMPRESSED=y
+
+# Giro 2: la console passa dal cavo USB (USB Serial/JTAG), cosi' la pagina dell'abbinamento
+# legge le risposte e scrive i comandi; certificati delle autorita' per parlare col ponte in HTTPS.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
