@@ -1,0 +1,12 @@
+## Componenti dal registro ufficiale Espressif (components.espressif.com), versioni ESATTE
+## (regola 36 di root: versione fissata, pubblicata da almeno due settimane). Verificate il 24/11/2026.
+## Le dipendenze di secondo livello le fissa dependencies.lock, prodotto dalla prima compilazione.
+dependencies:
+  idf: ">=5.5"
+  # Pacchetto ufficiale della scheda (schermo, tocco), Waveshare, 2.0.0 del 18/06/2026.
+  waveshare/esp32_s3_touch_amoled_2_06:
+    version: "==2.0.0"
+  # Libreria grafica, 9.5.0 del 18/02/2026 (la stessa dell'esempio Waveshare).
+  lvgl/lvgl:
+    version: "==9.5.0"
+    public: true
