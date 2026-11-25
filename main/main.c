@@ -573,9 +573,14 @@ static bool chiedi_stato_voce(char *risposta)
     cJSON *n = cJSON_GetObjectItemCaseSensitive(r, "nota");
     bool fine = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "fine"));
     bool con_risposta = cJSON_IsString(ri) && ri->valuestring[0];
-    snprintf(schermo_voce, RISPOSTA_VOCE_CAP + 64, "%s%s%s%s",
+    // File lasciati nello Scambio con la risposta: qui solo quanti sono, si aprono dal telefono.
+    cJSON *f = cJSON_GetObjectItemCaseSensitive(r, "file");
+    int n_file = cJSON_IsArray(f) ? cJSON_GetArraySize(f) : 0;
+    char riga_file[64] = "";
+    if (n_file > 0) snprintf(riga_file, sizeof riga_file, "\n\n%d file nello Scambio: aprili dal telefono", n_file);
+    snprintf(schermo_voce, RISPOSTA_VOCE_CAP + 64, "%s%s%s%s%s",
              cJSON_IsString(t) ? "Tu: " : "", cJSON_IsString(t) ? t->valuestring : "", cJSON_IsString(t) ? "\n\n" : "",
-             con_risposta ? ri->valuestring : cJSON_IsString(n) ? n->valuestring : "");
+             con_risposta ? ri->valuestring : cJSON_IsString(n) ? n->valuestring : "", riga_file);
     mostra_voce(schermo_voce, fine);
     if (fine) { if (con_risposta) vibra_due(); else vibra(60); }
     else riprova_voce = riprova_da(r);
