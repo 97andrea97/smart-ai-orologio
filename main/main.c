@@ -606,8 +606,7 @@ static bool registra_e_manda(char *risposta)
     if (n < 0) {
         free(pcm);
         char riga[160];
-        snprintf(riga, sizeof riga, "Microfoni non disponibili:
-%s", voce_errore()[0] ? voce_errore() : "motivo sconosciuto");
+        snprintf(riga, sizeof riga, "Microfoni non disponibili:\n%s", voce_errore()[0] ? voce_errore() : "motivo sconosciuto");
         mostra_voce(riga, true); vibra(250); return false;
     }
     if ((uint32_t)n * 1000u / VOCE_HZ < VOCE_MIN_MS) { free(pcm); mostra_voce("Troppo breve: tieni premuto BOOT mentre parli", true); return false; }
