@@ -12,6 +12,8 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_netif_sntp.h"
+#include <time.h>
 #include "mbedtls/gcm.h"
 
 static const char *TAG = "rete";
@@ -66,6 +68,12 @@ void rete_avvia(void)
     eventi = xEventGroupCreate();
     scambio = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());
+    // Ora dal wifi (25/11/2026): SNTP di ESP-IDF, si sincronizza da solo quando c'e' rete. Fuso di Roma con l'ora legale
+    // (regola POSIX: ultima domenica di marzo e di ottobre).
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+    esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp);
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();

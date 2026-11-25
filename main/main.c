@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -37,7 +38,7 @@ static const char *TAG = "smart-ai";
 static TaskHandle_t compito_motore = NULL;
 static QueueHandle_t richieste = NULL;     // messaggi JSON da spedire al PC, uno per volta
 
-static lv_obj_t *etichetta_stato, *etichetta_messaggio, *etichetta_pin, *tastierino, *riquadro_sbloccato;
+static lv_obj_t *etichetta_ora, *etichetta_stato, *etichetta_messaggio, *etichetta_pin, *tastierino, *riquadro_sbloccato;
 static char pin[LUNG_PIN_MAX + 1];
 static int cifre = 0;
 static int lung_pin = LUNG_PIN_MIN;   // dalla memoria: la decide il PC all'abbinamento
@@ -104,6 +105,11 @@ static void aggiorna_bloccato(void)
     char batt[16] = "--%";
     if (batt_percento >= 0) snprintf(batt, sizeof batt, "%d%%%s", batt_percento, batt_in_carica ? "+" : "");
     lv_label_set_text_fmt(etichetta_stato, "%s   %s  %s", batt, r, rete_nome());
+    time_t adesso = time(NULL);
+    struct tm t;
+    localtime_r(&adesso, &t);
+    if (t.tm_year + 1900 >= 2025) lv_label_set_text_fmt(etichetta_ora, "%02d:%02d", t.tm_hour, t.tm_min);
+    else lv_label_set_text(etichetta_ora, "--:--");   // ora non ancora presa dal wifi
     bool abbinato = memoria_abbinato();
     if (!abbinato) {
         lv_label_set_text(etichetta_messaggio, "Da abbinare: collega il cavo e apri\nsmart-AI > Impostazioni > Orologio");
@@ -221,7 +227,12 @@ static void disegna(void)
     etichetta_stato = lv_label_create(schermo);
     lv_obj_set_style_text_font(etichetta_stato, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(etichetta_stato, lv_color_hex(0x9AA5B1), 0);
-    lv_obj_align(etichetta_stato, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(etichetta_stato, LV_ALIGN_TOP_MID, 0, 10);
+
+    etichetta_ora = lv_label_create(schermo);
+    lv_obj_set_style_text_font(etichetta_ora, &lv_font_montserrat_48, 0);
+    lv_label_set_text(etichetta_ora, "--:--");
+    lv_obj_align(etichetta_ora, LV_ALIGN_TOP_MID, 0, 32);
 
     etichetta_messaggio = lv_label_create(schermo);
     lv_obj_set_width(etichetta_messaggio, 370);
@@ -229,16 +240,16 @@ static void disegna(void)
     lv_obj_set_style_text_align(etichetta_messaggio, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(etichetta_messaggio, &lv_font_montserrat_18, 0);
     lv_label_set_text(etichetta_messaggio, "smart-AI: inserisci il PIN");
-    lv_obj_align(etichetta_messaggio, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_align(etichetta_messaggio, LV_ALIGN_TOP_MID, 0, 96);
 
     etichetta_pin = lv_label_create(schermo);
     lv_obj_set_style_text_font(etichetta_pin, &lv_font_montserrat_26, 0);
-    lv_obj_align(etichetta_pin, LV_ALIGN_TOP_MID, 0, 104);
+    lv_obj_align(etichetta_pin, LV_ALIGN_TOP_MID, 0, 146);
 
     tastierino = lv_buttonmatrix_create(schermo);
     lv_buttonmatrix_set_map(tastierino, mappa);
-    lv_obj_set_size(tastierino, 380, 330);
-    lv_obj_align(tastierino, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_size(tastierino, 380, 290);
+    lv_obj_align(tastierino, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_set_style_bg_opa(tastierino, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tastierino, 0, 0);
     lv_obj_set_style_text_font(tastierino, &lv_font_montserrat_26, LV_PART_ITEMS);
