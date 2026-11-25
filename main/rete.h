@@ -25,4 +25,8 @@ typedef enum {
 
 // Spedisce il messaggio JSON al PC e mette la risposta JSON (gia' aperta e controllata) in `risposta`.
 ponte_esito_t ponte_scambia(const char *json, char *risposta, size_t cap);
+// Come ponte_scambia, per un messaggio di `lung` byte anche grande (i pezzi della voce, centinaia di KB): busta e
+// risposta stanno nella PSRAM. Con attendi=false non ritira la risposta (i pezzi intermedi della voce: il PC
+// risponde lo stesso e il ponte butta la risposta dopo dieci minuti); `risposta` resta com'era.
+ponte_esito_t ponte_manda(const char *json, size_t lung, bool attendi, char *risposta, size_t cap);
 const char *ponte_esito_testo(ponte_esito_t e);

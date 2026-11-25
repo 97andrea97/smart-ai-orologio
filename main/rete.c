@@ -15,6 +15,7 @@
 #include "esp_netif_sntp.h"
 #include <time.h>
 #include "mbedtls/gcm.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "rete";
 
@@ -113,9 +114,8 @@ static void nonce_di(uint8_t n[12], uint8_t direzione, uint64_t contatore)
     for (int i = 0; i < 8; i++) n[4 + i] = (uint8_t)(contatore >> (56 - 8 * i));
 }
 
-static int sigilla(const uint8_t chiave[32], uint64_t contatore, const char *json, uint8_t *fuori, size_t cap)
+static int sigilla(const uint8_t chiave[32], uint64_t contatore, const char *json, size_t lung, uint8_t *fuori, size_t cap)
 {
-    size_t lung = strlen(json);
     if (12 + lung + 16 > cap) return -1;
     nonce_di(fuori, DIR_OROLOGIO, contatore);
     mbedtls_gcm_context g;
@@ -196,6 +196,18 @@ const char *ponte_esito_testo(ponte_esito_t e)
 
 ponte_esito_t ponte_scambia(const char *json, char *risposta, size_t cap)
 {
+    return ponte_manda(json, strlen(json), true, risposta, cap);
+}
+
+// Buffer grandi (voce, 25/11/2026) nella PSRAM: la memoria interna serve a schermo e wifi (LEZIONI_OROLOGIO.md).
+static uint8_t *alloca_grande(size_t n)
+{
+    uint8_t *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(n);
+}
+
+ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char *risposta, size_t cap)
+{
     char base[160], gettone[65], url[220];
     uint8_t chiave[32];
     if (!memoria_ponte(base, sizeof base) || !memoria_gettone(gettone, sizeof gettone) || !memoria_chiave(chiave)) {
@@ -205,13 +217,16 @@ ponte_esito_t ponte_scambia(const char *json, char *risposta, size_t cap)
 
     xSemaphoreTake(scambio, portMAX_DELAY);
     ponte_esito_t esito = PONTE_ERRORE;
-    uint8_t *busta = malloc(MAX_BUSTA);
-    uint8_t *dati = malloc(MAX_BUSTA);
-    if (!busta || !dati) goto fine;
+    // La busta e' grande quanto il messaggio; quella di risposta quanto `cap` (piu' nonce e sigillo), mai meno di MAX_BUSTA.
+    size_t cap_busta = 12 + lung_json + 16;
+    size_t cap_dati = cap + 28 + 1 > MAX_BUSTA ? cap + 28 + 1 : MAX_BUSTA;
+    uint8_t *busta = cap_busta > MAX_BUSTA ? alloca_grande(cap_busta) : malloc(cap_busta);
+    uint8_t *dati = cap_dati > MAX_BUSTA ? alloca_grande(cap_dati) : malloc(cap_dati);
+    if (!busta || !dati) { ESP_LOGW(TAG, "memoria per la busta: %u byte", (unsigned)cap_busta); goto fine; }
 
     uint64_t contatore = memoria_contatore_nuovo();   // salvato prima di spedire
     if (contatore == 0) goto fine;
-    int lung = sigilla(chiave, contatore, json, busta, MAX_BUSTA);
+    int lung = sigilla(chiave, contatore, json, lung_json, busta, cap_busta);
     if (lung < 0) goto fine;
 
     int letti = 0;
@@ -225,11 +240,12 @@ ponte_esito_t ponte_scambia(const char *json, char *risposta, size_t cap)
     char *p = strstr((char *)dati, "\"id\"");
     char id[64] = { 0 };
     if (!p || sscanf(p, "\"id\":\"%63[^\"]\"", id) != 1) goto fine;
+    if (!attendi) { esito = PONTE_OK; goto fine; }
 
     snprintf(url, sizeof url, "%s/o/risposta?id=%s", base, id);
     esito = PONTE_NESSUNA_RISPOSTA;
     for (int t = 0; t < ATTESA_RISPOSTA_MS; t += PASSO_RISPOSTA_MS) {
-        stato = chiama(url, gettone, HTTP_METHOD_GET, NULL, 0, dati, MAX_BUSTA, &letti);
+        stato = chiama(url, gettone, HTTP_METHOD_GET, NULL, 0, dati, (int)cap_dati, &letti);
         if (stato == 200) {
             esito = apri(chiave, dati, letti, risposta, cap) ? PONTE_OK : PONTE_ERRORE;
             break;
