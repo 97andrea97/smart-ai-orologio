@@ -15,5 +15,6 @@ https://espressif.github.io/esptool-js/, dopo aver confrontato la sua sha256.
 
 Parti di configurazione e di struttura vengono dal repository ufficiale
 https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06 (esempio `02_lvgl_demo_v9` e
-componente `VibrationTest` del firmware di fabbrica), distribuito con licenza Apache 2.0:
+componenti `VibrationTest`, `ButtonTest`, `Recorder` e `bsp_extra` del firmware di fabbrica, questi ultimi tre
+per il tasto BOOT e i microfoni), distribuito con licenza Apache 2.0:
 vedi `LICENSE-APACHE-2.0`.
