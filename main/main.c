@@ -333,17 +333,15 @@ void app_main(void)
     lung_pin = memoria_lung_pin();
     richieste = xQueueCreate(4, sizeof(richiesta_t));
 
-    // Il wifi si accende PRIMA dello schermo: acceso dopo, si prendeva la memoria interna proprio mentre
-    // lo schermo spediva la prima immagine, un invio falliva ("spi transmit (queue) color failed" nel
-    // registro, 25/11/2026) e da li' fasce dello schermo restavano vecchie. Il ponte si usa dopo.
-    rete_avvia();
-
-    bsp_display_start();   // il pacchetto della scheda arrotonda gia' le zone a pixel pari
+    // Schermo PRIMA del wifi: la sua memoria per i trasferimenti si prende quando c'e'. Il pacchetto della
+    // scheda e' la copia corretta di Waveshare in components\ (vedi components\LEGGIMI.md).
+    bsp_display_start();
     bsp_display_lock(0);
     disegna();
     bsp_display_unlock();
 
     seriale_avvia(cambiato_dal_cavo);
+    rete_avvia();
     xTaskCreate(dialogo, "dialogo", 8192, NULL, 5, NULL);
     xTaskCreate(ritocco, "ritocco", 3072, NULL, 2, NULL);
 
