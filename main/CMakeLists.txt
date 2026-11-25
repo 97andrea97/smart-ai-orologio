@@ -1,8 +1,8 @@
 idf_component_register(
-    SRCS main.c memoria.c rete.c seriale.c aggiorna.c
+    SRCS main.c memoria.c rete.c seriale.c aggiorna.c batteria.c
     INCLUDE_DIRS .
     PRIV_REQUIRES esp_driver_gpio esp_driver_usb_serial_jtag esp_app_format nvs_flash
-                  esp_wifi esp_netif esp_event esp_http_client mbedtls json app_update)
+                  esp_wifi esp_netif esp_event esp_http_client mbedtls json app_update esp_driver_i2c)
 
 # Come nell'esempio 02_lvgl_demo_v9 di Waveshare: avvisi di LVGL non bloccanti.
 idf_build_get_property(build_components BUILD_COMPONENTS)

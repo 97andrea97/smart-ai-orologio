@@ -25,6 +25,7 @@
 #include "rete.h"
 #include "seriale.h"
 #include "aggiorna.h"
+#include "batteria.h"
 #include "esp_system.h"
 
 static const char *TAG = "smart-ai";
@@ -41,6 +42,11 @@ static char pin[LUNG_PIN_MAX + 1];
 static int cifre = 0;
 static int lung_pin = LUNG_PIN_MIN;   // dalla memoria: la decide il PC all'abbinamento
 static bool sbloccato = false;
+// Batteria: letta ogni LETTURA_BATTERIA_OGNI giri della riga di stato (un giro = 2 s, quindi ogni 30 s): assoluta, la
+// percentuale cambia lentamente e ogni lettura e' una chiamata sul bus I2C. -1 = non letta.
+#define LETTURA_BATTERIA_OGNI 15
+static int batt_percento = -1;
+static bool batt_in_carica = false;
 
 typedef struct { char json[96]; } richiesta_t;
 
@@ -87,7 +93,9 @@ static void aggiorna_bloccato(void)
         case RETE_NESSUNA_SALVATA: r = "nessun wifi"; break;
         default: r = "wifi spento"; break;
     }
-    lv_label_set_text_fmt(etichetta_stato, "%s  %s", r, rete_nome());
+    char batt[16] = "--%";
+    if (batt_percento >= 0) snprintf(batt, sizeof batt, "%d%%%s", batt_percento, batt_in_carica ? "+" : "");
+    lv_label_set_text_fmt(etichetta_stato, "%s   %s  %s", batt, r, rete_nome());
     bool abbinato = memoria_abbinato();
     if (!abbinato) {
         lv_label_set_text(etichetta_messaggio, "Da abbinare: collega il cavo e apri\nsmart-AI > Impostazioni > Orologio");
@@ -318,7 +326,14 @@ static void dialogo(void *arg)
 static void ritocco(void *arg)
 {
     (void)arg;
-    for (;;) { vTaskDelay(pdMS_TO_TICKS(2000)); cambiato_dal_cavo(); }
+    for (int giro = 0;; giro++) {
+        if (giro % LETTURA_BATTERIA_OGNI == 0) {
+            int p; bool c;
+            if (batteria_leggi(&p, &c)) { batt_percento = p; batt_in_carica = c; }
+        }
+        cambiato_dal_cavo();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
 
 void app_main(void)
@@ -350,6 +365,7 @@ void app_main(void)
     // (show_startup_screen in examples/factory/main/main.cpp): dopo la prima schermata e col blocco preso.
     bsp_display_backlight_on();
     bsp_display_unlock();
+    batteria_avvia();   // dopo lo schermo: il bus I2C e' gia' preparato dal pacchetto della scheda (touch)
 
     seriale_avvia(cambiato_dal_cavo);
     rete_avvia();
