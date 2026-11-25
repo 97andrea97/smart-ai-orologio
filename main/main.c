@@ -636,7 +636,7 @@ static void parla(void *arg)
     (void)arg;
     char *risposta = (char *)heap_caps_malloc(RISPOSTA_VOCE_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     schermo_voce = (char *)heap_caps_malloc(RISPOSTA_VOCE_CAP + 64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!risposta || !schermo_voce) { ESP_LOGE(TAG, "voce: memoria"); vTaskDelete(NULL); return; }
+    if (!risposta || !schermo_voce) { ESP_LOGE(TAG, "voce: memoria"); messaggio("Voce non disponibile: PSRAM piena"); vTaskDelete(NULL); return; }
     bool prima = false, segui = false;
     uint32_t prossima = 0;
     for (;;) {
@@ -652,7 +652,8 @@ static void parla(void *arg)
             }
             continue;
         }
-        if (!memoria_abbinato()) continue;
+        // Nessun caso muto (25/11/2026): ogni pressione da' un segno, anche quando non si puo' registrare.
+        if (!memoria_abbinato()) { messaggio("Voce: orologio non abbinato al PC"); vibra(250); continue; }
         if (!sbloccato) { messaggio("Disegna il gesto, poi tieni premuto BOOT per parlare"); continue; }
         // Un messaggio nuovo smette di seguire il precedente: la sua risposta resta nell'app.
         segui = registra_e_manda(risposta);
@@ -745,7 +746,20 @@ void app_main(void)
     gpio_config(&boot);
     xTaskCreate(veglia, "veglia", 3072, NULL, 3, NULL);
     // Voce: priorita' come il dialogo; pila larga per cJSON e la busta (le memorie grandi sono nella PSRAM).
-    xTaskCreate(parla, "parla", 8192, NULL, 5, NULL);
+    // 25/11/2026, prova sul vero: BOOT non faceva niente (nemmeno la vibrazione) mentre lo stesso tasto riaccendeva
+    // lo schermo: il compito non era partito. La pila sta nella memoria interna, che qui e' scarsa (vedi LEZIONI,
+    // esp-aes): si controlla l'esito, si riprova con una pila piu' piccola e, se non c'e' posto, lo si dice a schermo
+    // con la memoria interna libera, invece di restare muti.
+    size_t interna = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t blocco = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "voce: memoria interna libera %u, blocco piu' grande %u", (unsigned)interna, (unsigned)blocco);
+    if (xTaskCreate(parla, "parla", 8192, NULL, 5, NULL) != pdPASS
+        && xTaskCreate(parla, "parla", 6144, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "voce: compito non creato");
+        static char avviso[96];
+        snprintf(avviso, sizeof avviso, "Voce non disponibile: memoria interna piena\n(libera %u, blocco %u)", (unsigned)interna, (unsigned)blocco);
+        messaggio(avviso);
+    }
 
     vibra(200); // segno di vita all'accensione
 
