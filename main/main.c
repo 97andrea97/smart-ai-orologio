@@ -61,7 +61,7 @@ static int batt_percento = -1;
 // Schermo: si spegne dopo SCHERMO_SPENTO_DOPO_MS senza tocchi (25/11/2026, batteria). Assoluta: e' il tempo di lettura
 // di una riga dello schermo; diventera' una preferenza impostabile dall'app. Lo riaccendono PWR, BOOT, un tocco (che non
 // arriva ai tasti) o un messaggio del PC. PWR a schermo acceso lo spegne subito. Controllo ogni VEGLIA_PASSO_MS.
-#define SCHERMO_SPENTO_DOPO_MS 15000
+#define SCHERMO_SPENTO_DOPO_MS 30000   // 30 s, scelta del 25/11/2026 (15 s era troppo poco)
 #define VEGLIA_PASSO_MS        200
 #define TASTO_BOOT             GPIO_NUM_0
 static volatile bool schermo_spento = false;
