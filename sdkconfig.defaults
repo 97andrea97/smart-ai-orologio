@@ -42,3 +42,8 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # al primo invio al ponte. I buffer delle connessioni sicure vanno nella PSRAM esterna; la memoria interna resta allo
 # schermo e al wifi. Opzione documentata di ESP-IDF (Component config > mbedTLS > Memory allocation strategy).
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# Aggiornamento via wifi (25/11/2026): nel registro "esp-aes: Failed to allocate memory" e "esp-tls-mbedtls: read error"
+# durante lo scaricamento: la cifratura AES in hardware chiede memoria interna per il DMA e non la trova. La fa il processore:
+# un po' piu' lento, nessuna memoria interna in piu'. Opzione documentata di ESP-IDF (mbedTLS > Enable hardware AES acceleration).
+CONFIG_MBEDTLS_HARDWARE_AES=n
