@@ -46,6 +46,10 @@ static void evento(void *arg, esp_event_base_t base, int32_t id, void *dati)
         if (n_reti > 0) prova_rete(rete_corrente);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(eventi, BIT_COLLEGATA);
+        // Il motivo del rifiuto va nel registro (Console di esptool-js): 15 = password sbagliata,
+        // 201 = rete non trovata, 210 = protezione non compatibile (codici wifi_err_reason_t di ESP-IDF).
+        if (dati) ESP_LOGW(TAG, "wifi rifiutato da %s, motivo %d", reti[rete_corrente].ssid,
+                           ((wifi_event_sta_disconnected_t *)dati)->reason);
         if (n_reti == 0) { fase = RETE_NESSUNA_SALVATA; return; }
         rete_corrente = (rete_corrente + 1) % n_reti;   // la prossima rete salvata, a giro
         prova_rete(rete_corrente);
