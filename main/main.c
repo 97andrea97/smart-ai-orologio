@@ -221,6 +221,13 @@ static void disegna(void)
     bottone(riquadro_sbloccato, "Blocca", tocco_blocca);
     bottone(riquadro_sbloccato, "Aggiorna", tocco_aggiorna);
 
+    // Versione in piccolo in fondo: dopo un aggiornamento via wifi si vede subito se e' arrivato.
+    lv_obj_t *versione = lv_label_create(schermo);
+    lv_obj_set_style_text_font(versione, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(versione, lv_color_hex(0x5C6670), 0);
+    lv_label_set_text_fmt(versione, "v %s", esp_app_get_description()->version);
+    lv_obj_align(versione, LV_ALIGN_BOTTOM_MID, 0, -2);
+
     mostra_pin_bloccato();
     aggiorna_bloccato();
 }
