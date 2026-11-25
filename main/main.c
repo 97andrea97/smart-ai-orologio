@@ -61,6 +61,12 @@ static bool sbloccato = false;
 // Batteria: letta ogni LETTURA_BATTERIA_OGNI giri della riga di stato (un giro = 2 s, quindi ogni 30 s): assoluta, la
 // percentuale cambia lentamente e ogni lettura e' una chiamata sul bus I2C. -1 = non letta.
 #define LETTURA_BATTERIA_OGNI 15
+// Avviso di batteria bassa (25/11/2026): sotto BATTERIA_BASSA_PERCENTO, se non e' in carica, la percentuale diventa rossa e
+// l'orologio vibra UNA volta quando scende sotto la soglia. E' gia' una percentuale della capacita': 20% e' il consiglio
+// comune per le batterie al litio (ricaricare prima di scendere oltre).
+#define BATTERIA_BASSA_PERCENTO 20
+#define COLORE_STATO       0x9AA5B1
+#define COLORE_BATT_BASSA  0xE06C5A
 static int batt_percento = -1;
 // Schermo: si spegne dopo SCHERMO_SPENTO_DOPO_MS senza tocchi (25/11/2026, batteria). Assoluta: e' il tempo di lettura
 // di una riga dello schermo; diventera' una preferenza impostabile dall'app. Lo riaccendono PWR, BOOT, un tocco (che non
@@ -113,6 +119,8 @@ static void aggiorna_bloccato(void)
     char batt[16] = "--%";
     if (batt_percento >= 0) snprintf(batt, sizeof batt, "%d%%%s", batt_percento, batt_in_carica ? "+" : "");
     lv_label_set_text_fmt(etichetta_stato, "%s   %s  %s", batt, r, rete_nome());
+    bool bassa = batt_percento >= 0 && batt_percento <= BATTERIA_BASSA_PERCENTO && !batt_in_carica;
+    lv_obj_set_style_text_color(etichetta_stato, lv_color_hex(bassa ? COLORE_BATT_BASSA : COLORE_STATO), 0);
     time_t adesso = time(NULL);
     struct tm t;
     localtime_r(&adesso, &t);
@@ -267,7 +275,7 @@ static void disegna(void)
 
     etichetta_stato = lv_label_create(schermo);
     lv_obj_set_style_text_font(etichetta_stato, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(etichetta_stato, lv_color_hex(0x9AA5B1), 0);
+    lv_obj_set_style_text_color(etichetta_stato, lv_color_hex(COLORE_STATO), 0);
     lv_obj_align(etichetta_stato, LV_ALIGN_TOP_MID, 0, 10);
 
     etichetta_ora = lv_label_create(schermo);
@@ -447,7 +455,12 @@ static void ritocco(void *arg)
     for (int giro = 0;; giro++) {
         if (giro % LETTURA_BATTERIA_OGNI == 0) {
             int p; bool c;
-            if (batteria_leggi(&p, &c)) { batt_percento = p; batt_in_carica = c; }
+            if (batteria_leggi(&p, &c)) {
+                bool era_bassa = batt_percento >= 0 && batt_percento <= BATTERIA_BASSA_PERCENTO;
+                if (!c && p <= BATTERIA_BASSA_PERCENTO && !era_bassa) vibra(250);   // una volta, quando scende sotto la soglia
+                batt_percento = p;
+                batt_in_carica = c;
+            }
         }
         cambiato_dal_cavo();
         vTaskDelay(pdMS_TO_TICKS(2000));
