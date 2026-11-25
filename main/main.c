@@ -736,10 +736,9 @@ void app_main(void)
     bsp_display_unlock();
     batteria_avvia();   // dopo lo schermo: il bus I2C e' gia' preparato dal pacchetto della scheda (touch)
 
-    // Microfoni pronti PRIMA del wifi (25/11/2026, "Microfoni non disponibili" sul vero): l'I2S chiede memoria
-    // interna per il DMA, che wifi e TLS consumano dopo; il firmware di fabbrica prepara l'audio all'avvio. Se
-    // fallisce qui si riprova alla prima pressione di BOOT, e lo schermo dice il passo e il motivo.
-    if (!voce_avvia()) ESP_LOGE(TAG, "voce all'avvio: %s", voce_errore());
+    // NIENTE microfoni all'avvio (25/11/2026): con voce_avvia() qui, fw 3371fd9 non arrivava a parlare col PC e
+    // l'orologio tornava alla versione precedente (vedi LEZIONI). Si preparano alla prima pressione di BOOT, e se
+    // falliscono lo schermo dice il passo e il motivo (voce_errore).
 
     seriale_avvia(cambiato_dal_cavo);
     rete_avvia();
