@@ -8,6 +8,8 @@
 //   0x30 bit 0 = misura della tensione di batteria accesa
 //   0x68 bit 0 = rilevamento della batteria acceso
 //   0xA4 = percentuale (0-100)
+//   0x41 bit 3 = abilita l'avviso di pressione breve del tasto PWR (PKEY_SHORT_IRQ = bit 11, secondo registro)
+//   0x49 bit 3 = pressione breve avvenuta; si azzera scrivendo 1 su quel bit
 #include "batteria.h"
 #include "bsp/esp-bsp.h"
 #include "driver/i2c_master.h"
@@ -42,7 +44,9 @@ void batteria_avvia(void)
         .scl_speed_hz = 100000,
     };
     if (i2c_master_bus_add_device(bsp_i2c_get_handle(), &cfg, &pmu) != ESP_OK) { pmu = NULL; ESP_LOGW(TAG, "AXP2101 non aggiunto"); return; }
-    bool ok = accendi_bit(0x68, 0) && accendi_bit(0x30, 0) && accendi_bit(0x18, 3);
+    bool ok = accendi_bit(0x68, 0) && accendi_bit(0x30, 0) && accendi_bit(0x18, 3) && accendi_bit(0x41, 3);
+    uint8_t azzera[2] = { 0x49, 0x08 };
+    if (ok) i2c_master_transmit(pmu, azzera, 2, ATTESA_MS);
     ESP_LOGI(TAG, "AXP2101 %s", ok ? "pronto" : "non risponde");
 }
 
@@ -53,5 +57,14 @@ bool batteria_leggi(int *percento, bool *in_carica)
     if (!leggi(0xA4, &p) || !leggi(0x01, &s2)) return false;
     *percento = p > 100 ? 100 : p;
     *in_carica = (s2 >> 5) == 0x01;
+    return true;
+}
+
+bool batteria_tasto_pwr(void)
+{
+    uint8_t s;
+    if (!leggi(0x49, &s) || !(s & 0x08)) return false;
+    uint8_t azzera[2] = { 0x49, 0x08 };
+    i2c_master_transmit(pmu, azzera, 2, ATTESA_MS);
     return true;
 }

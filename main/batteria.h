@@ -4,3 +4,4 @@
 
 void batteria_avvia(void);                            // dopo bsp_display_start (bus I2C condiviso col touch)
 bool batteria_leggi(int *percento, bool *in_carica);  // false se la batteria o il chip non rispondono
+bool batteria_tasto_pwr(void);                        // true una volta per ogni pressione breve di PWR

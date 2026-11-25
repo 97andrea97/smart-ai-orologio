@@ -46,6 +46,14 @@ static bool sbloccato = false;
 // percentuale cambia lentamente e ogni lettura e' una chiamata sul bus I2C. -1 = non letta.
 #define LETTURA_BATTERIA_OGNI 15
 static int batt_percento = -1;
+// Schermo: si spegne dopo SCHERMO_SPENTO_DOPO_MS senza tocchi (25/11/2026, batteria). Assoluta: e' il tempo di lettura
+// di una riga dello schermo; diventera' una preferenza impostabile dall'app. Lo riaccendono PWR, BOOT, un tocco (che non
+// arriva ai tasti) o un messaggio del PC. PWR a schermo acceso lo spegne subito. Controllo ogni VEGLIA_PASSO_MS.
+#define SCHERMO_SPENTO_DOPO_MS 15000
+#define VEGLIA_PASSO_MS        200
+#define TASTO_BOOT             GPIO_NUM_0
+static volatile bool schermo_spento = false;
+static lv_obj_t *velo = NULL;   // copre tutto a schermo spento: il primo tocco riaccende e basta
 static bool batt_in_carica = false;
 
 typedef struct { char json[96]; } richiesta_t;
@@ -105,9 +113,29 @@ static void aggiorna_bloccato(void)
     visibile(riquadro_sbloccato, abbinato && sbloccato);
 }
 
+static void accendi_bloccato(void)
+{
+    if (!schermo_spento) return;
+    lv_obj_add_flag(velo, LV_OBJ_FLAG_HIDDEN);
+    bsp_display_backlight_on();
+    lv_display_trigger_activity(NULL);
+    schermo_spento = false;
+}
+
+static void spegni_bloccato(void)
+{
+    if (schermo_spento) return;
+    lv_obj_remove_flag(velo, LV_OBJ_FLAG_HIDDEN);
+    bsp_display_backlight_off();
+    schermo_spento = true;
+}
+
+static void tocco_velo(lv_event_t *e) { (void)e; accendi_bloccato(); }   // callback di LVGL: blocco gia' preso
+
 static void messaggio(const char *testo)
 {
     bsp_display_lock(0);
+    accendi_bloccato();   // una risposta del PC si vede subito
     lv_label_set_text(etichetta_messaggio, testo);
     aggiorna_bloccato();
     bsp_display_unlock();
@@ -238,6 +266,13 @@ static void disegna(void)
 
     mostra_pin_bloccato();
     aggiorna_bloccato();
+
+    velo = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(velo);
+    lv_obj_set_size(velo, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(velo, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(velo, tocco_velo, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(velo, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ---- dialogo col PC ----------------------------------------------------------------------------------
@@ -322,6 +357,25 @@ static void dialogo(void *arg)
     }
 }
 
+// Veglia: tasti PWR e BOOT, e spegnimento dello schermo dopo un po' senza tocchi.
+static void veglia(void *arg)
+{
+    (void)arg;
+    bool boot_prima = false;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(VEGLIA_PASSO_MS));
+        bool pwr = batteria_tasto_pwr();
+        bool boot = gpio_get_level(TASTO_BOOT) == 0;
+        bool boot_premuto = boot && !boot_prima;
+        boot_prima = boot;
+        bsp_display_lock(0);
+        if (pwr && !schermo_spento) spegni_bloccato();
+        else if ((pwr || boot_premuto) && schermo_spento) { accendi_bloccato(); vibra(30); }
+        else if (!schermo_spento && lv_display_get_inactive_time(NULL) > SCHERMO_SPENTO_DOPO_MS) spegni_bloccato();
+        bsp_display_unlock();
+    }
+}
+
 // Ogni 2 secondi la riga di stato (wifi) si aggiorna da sola.
 static void ritocco(void *arg)
 {
@@ -371,6 +425,16 @@ void app_main(void)
     rete_avvia();
     xTaskCreate(dialogo, "dialogo", 8192, NULL, 5, NULL);
     xTaskCreate(ritocco, "ritocco", 3072, NULL, 2, NULL);
+
+    gpio_config_t boot = {
+        .pin_bit_mask = 1ULL << TASTO_BOOT,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&boot);
+    xTaskCreate(veglia, "veglia", 3072, NULL, 3, NULL);
 
     vibra(200); // segno di vita all'accensione
 
