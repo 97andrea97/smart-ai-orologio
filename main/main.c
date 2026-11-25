@@ -336,11 +336,12 @@ void app_main(void)
     // Schermo PRIMA del wifi: la sua memoria per i trasferimenti si prende quando c'e'. Il pacchetto della
     // scheda e' la copia corretta di Waveshare in components\ (vedi components\LEGGIMI.md).
     bsp_display_start();
-    // La copia di fabbrica parte con luminosita' 0 (bsp/display.h: "The display's backlight is not turned on"):
-    // senza questa riga lo schermo resta nero anche se disegna (visto sul vero il 25/11/2026).
-    bsp_display_backlight_on();
     bsp_display_lock(0);
     disegna();
+    // La copia di fabbrica parte con luminosita' 0 (bsp/display.h: "The display's backlight is not turned on"):
+    // senza questa riga lo schermo resta nero (visto sul vero il 25/11/2026). Come il firmware di fabbrica
+    // (show_startup_screen in examples/factory/main/main.cpp): dopo la prima schermata e col blocco preso.
+    bsp_display_backlight_on();
     bsp_display_unlock();
 
     seriale_avvia(cambiato_dal_cavo);
