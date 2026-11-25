@@ -65,6 +65,18 @@ static void vibra_due(void) { vibra(90); vTaskDelay(pdMS_TO_TICKS(220)); vibra(9
 
 // ---- schermo (le funzioni *_bloccato vanno chiamate con il blocco di LVGL preso) --------------------
 
+// Lo schermo AMOLED accetta solo zone che iniziano su un pixel pari e finiscono su uno dispari: con
+// zone qualsiasi un ridisegno parziale (la riga del wifi ogni 2 secondi) lascia strisce bianche e nere
+// (visto sull'orologio vero il 25/11/2026). Come rounder_event_cb degli esempi Waveshare per questa scheda.
+static void arrotonda(lv_event_t *e)
+{
+    lv_area_t *a = (lv_area_t *)lv_event_get_param(e);
+    a->x1 &= ~1;
+    a->y1 &= ~1;
+    a->x2 |= 1;
+    a->y2 |= 1;
+}
+
 static void visibile(lv_obj_t *o, bool si)
 {
     if (si) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
@@ -333,8 +345,9 @@ void app_main(void)
     lung_pin = memoria_lung_pin();
     richieste = xQueueCreate(4, sizeof(richiesta_t));
 
-    bsp_display_start();
+    lv_display_t *schermo = bsp_display_start();
     bsp_display_lock(0);
+    if (schermo) lv_display_add_event_cb(schermo, arrotonda, LV_EVENT_INVALIDATE_AREA, NULL);
     disegna();
     bsp_display_unlock();
 
