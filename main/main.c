@@ -29,7 +29,7 @@ static const char *TAG = "smart-ai";
 // Motorino: piedino 18, mai acceso piu' di MOTORE_MAX_MS per volta (come VibrationTest di Waveshare).
 #define MOTORE        GPIO_NUM_18
 #define MOTORE_MAX_MS 250
-#define LUNG_PIN      6
+#define LUNG_PIN      4
 
 static TaskHandle_t compito_motore = NULL;
 static QueueHandle_t richieste = NULL;     // messaggi JSON da spedire al PC, uno per volta
@@ -128,7 +128,7 @@ static void tasto(lv_event_t *e)
     if (strcmp(testo, "C") == 0) {
         cifre = 0;
     } else if (strcmp(testo, "OK") == 0) {
-        if (cifre != LUNG_PIN) { lv_label_set_text(etichetta_messaggio, "Il PIN e' di 6 cifre"); return; }
+        if (cifre != LUNG_PIN) { lv_label_set_text(etichetta_messaggio, "Il PIN e' di 4 cifre"); return; }
         char json[64];
         pin[LUNG_PIN] = 0;
         snprintf(json, sizeof json, "{\"t\":\"sblocca\",\"pin\":\"%s\"}", pin);
