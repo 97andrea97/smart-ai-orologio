@@ -25,16 +25,28 @@ static esp_codec_dev_handle_t altoparlante = NULL, microfoni = NULL;
 // 256 frame x 4 posti x 16 bit = 2 KB: piccolo, in memoria interna come nel registratore di fabbrica.
 static int16_t grezzo[LETTURA_FRAME * POSTI_TDM];
 
+// 25/11/2026, prova sul vero: "Microfoni non disponibili" senza sapere dove. Il passo fallito e il motivo vanno a schermo
+// (voce_errore), con la memoria interna adatta al DMA ancora libera: niente cavo per capirlo.
+static char errore[96];
+const char *voce_errore(void) { return errore; }
+static void segna(const char *passo, esp_err_t e)
+{
+    snprintf(errore, sizeof errore, "%s: %s (DMA libera %u)", passo, e == ESP_OK ? "fallito" : esp_err_to_name(e),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    ESP_LOGE(TAG, "%s", errore);
+}
+
 bool voce_avvia(void)
 {
+    errore[0] = 0;
     if (microfoni) return true;
     // Stessa sequenza di bsp_extra_codec_init: bus a 24 kHz (uscita normale, ingresso TDM), poi altoparlante e microfoni.
     esp_err_t e = bsp_audio_init_voice_24k();
-    if (e != ESP_OK) { ESP_LOGE(TAG, "bsp_audio_init_voice_24k: %s", esp_err_to_name(e)); return false; }
+    if (e != ESP_OK) { segna("avvio I2S", e); return false; }
     altoparlante = bsp_audio_codec_speaker_init();
     microfoni = altoparlante ? bsp_audio_codec_microphone_init() : NULL;
     if (!altoparlante || !microfoni) {
-        ESP_LOGE(TAG, "codec non pronto (altoparlante %d, microfoni %d)", altoparlante != NULL, microfoni != NULL);
+        segna(!altoparlante ? "codec altoparlante" : "codec microfoni", ESP_OK);
         bsp_audio_deinit();
         altoparlante = microfoni = NULL;
         return false;
@@ -52,10 +64,10 @@ long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void))
     esp_codec_dev_sample_info_t ingresso = {
         .sample_rate = VOCE_HZ, .channel = POSTI_TDM, .channel_mask = POSTI_TUTTI, .bits_per_sample = 16,
     };
-    if (esp_codec_dev_open(altoparlante, &uscita) != ESP_CODEC_DEV_OK) { ESP_LOGE(TAG, "apertura uscita"); return -1; }
+    if (esp_codec_dev_open(altoparlante, &uscita) != ESP_CODEC_DEV_OK) { segna("apertura uscita", ESP_OK); return -1; }
     esp_codec_dev_set_out_mute(altoparlante, true);
     if (esp_codec_dev_open(microfoni, &ingresso) != ESP_CODEC_DEV_OK) {
-        ESP_LOGE(TAG, "apertura microfoni");
+        segna("apertura microfoni", ESP_OK);
         esp_codec_dev_close(altoparlante);
         return -1;
     }
@@ -65,7 +77,7 @@ long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void))
     bool ok = true;
     int32_t picco = 0;
     while (n < max_campioni && continua()) {
-        if (esp_codec_dev_read(microfoni, grezzo, sizeof grezzo) != ESP_CODEC_DEV_OK) { ok = false; break; }
+        if (esp_codec_dev_read(microfoni, grezzo, sizeof grezzo) != ESP_CODEC_DEV_OK) { segna("lettura", ESP_OK); ok = false; break; }
         for (int f = 0; f < LETTURA_FRAME && n < max_campioni; f++) {
             int32_t m = ((int32_t)grezzo[f * POSTI_TDM + POSTO_MIC1] + grezzo[f * POSTI_TDM + POSTO_MIC2]) / 2;
             pcm[n++] = (int16_t)m;

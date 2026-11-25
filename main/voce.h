@@ -22,6 +22,8 @@
 
 // Prepara microfoni e altoparlante la prima volta (poi non fa niente). false se il pacchetto della scheda fallisce.
 bool voce_avvia(void);
+// L'ultimo passo fallito dell'avvio o della lettura dei microfoni, per lo schermo (vuoto se nessuno).
+const char *voce_errore(void);
 // Registra in `pcm` (mono, VOCE_HZ, 16 bit) finche' continua() dice true o il posto finisce. Torna i campioni
 // scritti, oppure -1 se i microfoni non si aprono o non si leggono.
 long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void));

@@ -603,7 +603,13 @@ static bool registra_e_manda(char *risposta)
     inizio_registrazione = adesso_ms();
     ultimo_secondo = UINT32_MAX;
     long n = voce_registra(pcm, max, continua_registrazione);
-    if (n < 0) { free(pcm); mostra_voce("Microfoni non disponibili (vedi il registro)", true); vibra(250); return false; }
+    if (n < 0) {
+        free(pcm);
+        char riga[160];
+        snprintf(riga, sizeof riga, "Microfoni non disponibili:
+%s", voce_errore()[0] ? voce_errore() : "motivo sconosciuto");
+        mostra_voce(riga, true); vibra(250); return false;
+    }
     if ((uint32_t)n * 1000u / VOCE_HZ < VOCE_MIN_MS) { free(pcm); mostra_voce("Troppo breve: tieni premuto BOOT mentre parli", true); return false; }
     char riga[80];
     snprintf(riga, sizeof riga, "Invio %ld s di audio...%s", n / VOCE_HZ, (size_t)n >= max ? "\n(durata massima raggiunta)" : "");
@@ -730,6 +736,11 @@ void app_main(void)
     bsp_display_backlight_on();
     bsp_display_unlock();
     batteria_avvia();   // dopo lo schermo: il bus I2C e' gia' preparato dal pacchetto della scheda (touch)
+
+    // Microfoni pronti PRIMA del wifi (25/11/2026, "Microfoni non disponibili" sul vero): l'I2S chiede memoria
+    // interna per il DMA, che wifi e TLS consumano dopo; il firmware di fabbrica prepara l'audio all'avvio. Se
+    // fallisce qui si riprova alla prima pressione di BOOT, e lo schermo dice il passo e il motivo.
+    if (!voce_avvia()) ESP_LOGE(TAG, "voce all'avvio: %s", voce_errore());
 
     seriale_avvia(cambiato_dal_cavo);
     rete_avvia();
