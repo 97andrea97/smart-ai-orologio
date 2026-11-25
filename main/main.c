@@ -95,6 +95,19 @@ static int batt_percento = -1;
 static volatile bool schermo_spento = false;
 static lv_obj_t *velo = NULL;   // copre tutto a schermo spento: il primo tocco riaccende e basta
 static bool batt_in_carica = false;
+static int batt_mv = -1;   // tensione in millivolt, -1 = non letta
+// Misura della batteria (25/11/2026, PROTOCOLLO.md del PC, "Batteria"): ogni messaggio al PC porta "batt" (percentuale,
+// carica, tensione, schermo acceso adesso, secondi di schermo acceso e secondi dall'avvio, versione) e, se per
+// BATTERIA_RAPPORTO_MS non e' partito niente, l'orologio manda {"t":"batteria"} da solo. Lo stesso numero sta in
+// pc/regole.mjs (BATTERIA_RAPPORTO_MS): RELATIVO alla risoluzione della percentuale (un punto intero, circa ogni 10 minuti
+// a schermo spento) e al costo di un invio (1-2 s di radio, meno dello 0,3% del tempo).
+#define BATTERIA_RAPPORTO_MS (10 * 60 * 1000)
+// Un messaggio con "batt" in coda: il piu' lungo (aggiorna, 75 caratteri) piu' "batt" (al massimo circa 110).
+#define RICHIESTA_CON_BATTERIA 256
+static volatile uint32_t acceso_ms = 0;    // millisecondi di schermo acceso dall'avvio, fino all'ultimo spegnimento
+static volatile uint32_t acceso_dal = 0;   // quando si e' acceso l'ultima volta (all'avvio e' acceso)
+static volatile uint32_t ultimo_rapporto = 0;
+static volatile bool mai_rapportato = true;
 
 typedef struct { char json[96]; } richiesta_t;
 
@@ -166,6 +179,7 @@ static void accendi_bloccato(void)
     lv_obj_add_flag(velo, LV_OBJ_FLAG_HIDDEN);
     bsp_display_backlight_on();
     lv_display_trigger_activity(NULL);
+    acceso_dal = adesso_ms();
     schermo_spento = false;
 }
 
@@ -174,7 +188,34 @@ static void spegni_bloccato(void)
     if (schermo_spento) return;
     lv_obj_remove_flag(velo, LV_OBJ_FLAG_HIDDEN);
     bsp_display_backlight_off();
+    acceso_ms += adesso_ms() - acceso_dal;
     schermo_spento = true;
+}
+
+// Secondi di schermo acceso dall'avvio, compreso il tratto in corso. Si legge senza il blocco di LVGL: sono interi a 32
+// bit, e una lettura a cavallo di un'accensione sbaglia al piu' di qualche millisecondo.
+static uint32_t secondi_acceso(void)
+{
+    uint32_t ms = acceso_ms;
+    if (!schermo_spento) ms += adesso_ms() - acceso_dal;
+    return ms / 1000;
+}
+
+// Aggiunge "batt" a un messaggio per il PC (`json` finisce con '}'), in `fuori`. Se la batteria non e' ancora stata
+// letta, o non c'e' posto, torna il messaggio com'era. I secondi dall'avvio vengono dal contatore di FreeRTOS: dopo 49
+// giorni senza riavvio ricominciano da zero e il PC lo tratta come un riavvio (un tratto in meno, niente di sbagliato).
+static const char *con_batteria(const char *json, char *fuori, size_t cap)
+{
+    size_t n = strlen(json);
+    if (batt_percento < 0 || n < 2 || json[n - 1] != '}') return json;
+    int k = snprintf(fuori, cap, "%.*s,\"batt\":{\"p\":%d,\"c\":%d,\"mv\":%d,\"s\":%d,\"a\":%lu,\"u\":%lu,\"v\":\"%.24s\"}}",
+                     (int)(n - 1), json, batt_percento, batt_in_carica ? 1 : 0, batt_mv, schermo_spento ? 0 : 1,
+                     (unsigned long)secondi_acceso(), (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ),
+                     esp_app_get_description()->version);
+    if (k < 0 || (size_t)k >= cap) return json;
+    ultimo_rapporto = adesso_ms();
+    mai_rapportato = false;
+    return fuori;
 }
 
 static void tocco_velo(lv_event_t *e) { (void)e; accendi_bloccato(); }   // callback di LVGL: blocco gia' preso
@@ -575,6 +616,7 @@ static void dialogo(void *arg)
 {
     (void)arg;
     static char risposta[1024];
+    static char con[RICHIESTA_CON_BATTERIA];
     richiesta_t r;
     uint32_t telemetria_dopo = 0, telemetria_attesa = TELEMETRIA_RIPROVA_MS;
     for (;;) {
@@ -587,13 +629,21 @@ static void dialogo(void *arg)
             }
             continue;
         }
-        ponte_esito_t e = ponte_scambia(r.json, risposta, sizeof risposta);
-        if (e == PONTE_OK) {
-            aggiorna_conferma();   // il PC ha risposto: il programma nuovo funziona e resta
-            gestisci_risposta(r.json, risposta);
+        const char *json = con_batteria(r.json, con, sizeof con);
+        if (strcmp(r.json, "{\"t\":\"batteria\"}") == 0) {
+            // Rapporto della batteria: una sola chiamata, senza ritirare la risposta (come i pezzi intermedi della voce).
+            // Nessun messaggio a schermo e nessuna vibrazione, nemmeno se non parte: non deve mai disturbare.
+            ponte_manda(json, strlen(json), false, risposta, sizeof risposta);
+        } else {
+            ponte_esito_t e = ponte_scambia(json, risposta, sizeof risposta);
+            if (e == PONTE_OK) {
+                aggiorna_conferma();   // il PC ha risposto: il programma nuovo funziona e resta
+                gestisci_risposta(r.json, risposta);
+            }
+            else { errore_msg(origine_di(r.json), ponte_esito_testo(e)); vibra(250); }
         }
-        else { errore_msg(origine_di(r.json), ponte_esito_testo(e)); vibra(250); }
         memset(&r, 0, sizeof r);
+        memset(con, 0, sizeof con);   // dentro c'e' anche il gesto, quando il messaggio e' "sblocca"
         memset(risposta, 0, sizeof risposta);
     }
 }
@@ -901,9 +951,9 @@ static void ascolta(void)
 static bool chiedi_stato_voce(char *risposta)
 {
     if (adesso_ms() - voce_dal > ATTESA_VOCE_MAX_MS) { errore_voce("stato", "Non aspetto piu': la risposta sara' nell'app"); return false; }
-    char json[96];
+    char json[96], con[RICHIESTA_CON_BATTERIA];
     snprintf(json, sizeof json, "{\"t\":\"voce_stato\",\"id\":\"%.36s\"}", id_voce);
-    ponte_esito_t e = ponte_scambia(json, risposta, RISPOSTA_VOCE_CAP);
+    ponte_esito_t e = ponte_scambia(con_batteria(json, con, sizeof con), risposta, RISPOSTA_VOCE_CAP);
     if (e != PONTE_OK) {
         if (++errori_voce < ERRORI_STATO_MAX) return true;
         errore_voce("stato", ponte_esito_testo(e));
@@ -1232,6 +1282,16 @@ static void ritocco(void *arg)
                 batt_percento = p;
                 batt_in_carica = c;
             }
+            int mv;
+            if (batteria_tensione(&mv)) batt_mv = mv;
+        }
+        // Rapporto della batteria quando per BATTERIA_RAPPORTO_MS non e' partito niente (ogni messaggio porta gia' "batt"):
+        // solo abbinato, col wifi collegato e con la batteria gia' letta. Il primo parte appena c'e' tutto: segna l'avvio.
+        if (batt_percento >= 0 && memoria_abbinato() && rete_fase() == RETE_COLLEGATA
+            && (mai_rapportato || adesso_ms() - ultimo_rapporto >= BATTERIA_RAPPORTO_MS)) {
+            ultimo_rapporto = adesso_ms();   // anche se la coda e' piena: si riprova al prossimo intervallo
+            mai_rapportato = false;
+            spedisci("{\"t\":\"batteria\"}");
         }
         cambiato_dal_cavo();
         vTaskDelay(pdMS_TO_TICKS(2000));

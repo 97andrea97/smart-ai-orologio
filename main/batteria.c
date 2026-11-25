@@ -8,6 +8,8 @@
 //   0x30 bit 0 = misura della tensione di batteria accesa
 //   0x68 bit 0 = rilevamento della batteria acceso
 //   0xA4 = percentuale (0-100)
+//   0x34 bit 4..0 e 0x35 = tensione della batteria in millivolt (ADC_DATA_RELUST0/1; getBattVoltage legge i due
+//        registri con readRegisterH5L8: ((alto & 0x1F) << 8) | basso), con la misura accesa dal bit 0 di 0x30
 //   0x41 bit 3 = abilita l'avviso di pressione breve del tasto PWR (PKEY_SHORT_IRQ = bit 11, secondo registro)
 //   0x49 bit 3 = pressione breve avvenuta; si azzera scrivendo 1 su quel bit
 #include "batteria.h"
@@ -57,6 +59,16 @@ bool batteria_leggi(int *percento, bool *in_carica)
     if (!leggi(0xA4, &p) || !leggi(0x01, &s2)) return false;
     *percento = p > 100 ? 100 : p;
     *in_carica = (s2 >> 5) == 0x01;
+    return true;
+}
+
+// Come getBattVoltage di XPowersLib (src/XPowersAXP2101.hpp): 0 se la batteria non c'e', qui false.
+bool batteria_tensione(int *mv)
+{
+    uint8_t s1, alto, basso;
+    if (!leggi(0x00, &s1) || !(s1 & (1u << 3))) return false;
+    if (!leggi(0x34, &alto) || !leggi(0x35, &basso)) return false;
+    *mv = ((alto & 0x1F) << 8) | basso;
     return true;
 }
 
