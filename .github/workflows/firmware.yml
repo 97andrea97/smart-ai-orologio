@@ -45,6 +45,7 @@ jobs:
           cp "$(find build -name smart-ai-orologio.bin -print -quit)" uscita/
           cp build/smart_ai_orologio.bin uscita/smart-ai-orologio-wifi.bin
           cp dependencies.lock uscita/
+          cp sdkconfig uscita/sdkconfig.txt
           cd uscita
           sha256sum smart-ai-orologio.bin | tee smart-ai-orologio.bin.sha256
           sha256sum smart-ai-orologio-wifi.bin | tee smart-ai-orologio-wifi.bin.sha256
@@ -77,4 +78,5 @@ jobs:
           gh release create "fw-${GITHUB_SHA:0:7}" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Firmware ${GITHUB_SHA:0:7}" --notes "Compilato da $GITHUB_SHA." \
             uscita/smart-ai-orologio.bin uscita/smart-ai-orologio.bin.sha256 \
-            uscita/smart-ai-orologio-wifi.bin uscita/smart-ai-orologio-wifi.bin.sha256
+            uscita/smart-ai-orologio-wifi.bin uscita/smart-ai-orologio-wifi.bin.sha256 \
+            uscita/sdkconfig.txt
