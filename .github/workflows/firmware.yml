@@ -5,7 +5,11 @@
 #   - immagine ufficiale Espressif espressif/idf:v5.5.5 (17/07/2026), la stessa versione che
 #     Waveshare usa per questa scheda;
 #   - actions/checkout v7.0.1 (20/07/2026) e actions/upload-artifact v7.0.2 (07/10/2026), di GitHub.
-# Risultato: smart-ai-orologio.bin (immagine unica, da scrivere all'indirizzo 0x0) e la sua sha256.
+# Risultato: smart-ai-orologio.bin (immagine unica, da scrivere col cavo all'indirizzo 0x0),
+# smart-ai-orologio-wifi.bin (il solo programma, per l'aggiornamento via wifi) e le loro sha256.
+# Dal giro 3 (25/11/2026) il secondo lavoro, "pubblica", mette i file in una release fw-<commit>:
+# da li' l'orologio scarica l'aggiornamento, controllando l'impronta che gli manda il PC. E' l'unico
+# lavoro che puo' scrivere nel repository, e non compila niente: prende i file del primo.
 name: Firmware orologio
 
 on:
@@ -28,17 +32,22 @@ jobs:
 
       - name: Compila
         shell: bash
+        env:
+          VERSIONE_FIRMWARE: ${{ github.sha }}
         run: |
           set -euo pipefail
+          export VERSIONE_FIRMWARE="${VERSIONE_FIRMWARE:0:7}"
           . "$IDF_PATH/export.sh"
           idf.py --version
           idf.py set-target esp32s3 build
           idf.py merge-bin -o smart-ai-orologio.bin
           mkdir -p uscita
           cp "$(find build -name smart-ai-orologio.bin -print -quit)" uscita/
+          cp build/smart_ai_orologio.bin uscita/smart-ai-orologio-wifi.bin
           cp dependencies.lock uscita/
           cd uscita
           sha256sum smart-ai-orologio.bin | tee smart-ai-orologio.bin.sha256
+          sha256sum smart-ai-orologio-wifi.bin | tee smart-ai-orologio-wifi.bin.sha256
           ls -l
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -47,3 +56,25 @@ jobs:
           path: uscita/
           if-no-files-found: error
           retention-days: 30
+
+  pubblica:
+    needs: compila
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Release fw-<commit> con i file compilati
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n firmware-orologio -D uscita
+          ls -l uscita
+          gh release create "fw-${GITHUB_SHA:0:7}" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Firmware ${GITHUB_SHA:0:7}" --notes "Compilato da $GITHUB_SHA." \
+            uscita/smart-ai-orologio.bin uscita/smart-ai-orologio.bin.sha256 \
+            uscita/smart-ai-orologio-wifi.bin uscita/smart-ai-orologio-wifi.bin.sha256

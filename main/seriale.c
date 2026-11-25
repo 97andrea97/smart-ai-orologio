@@ -70,11 +70,14 @@ static void esegui(const char *riga)
         rispondi(r);
     } else if (cmd && strcmp(cmd, "abbina") == 0) {
         const char *ponte = testo_di(o, "ponte"), *gettone = testo_di(o, "gettone"), *chiave_hex = testo_di(o, "chiave");
+        cJSON *lp = cJSON_GetObjectItemCaseSensitive(o, "lung_pin");
+        int lung_pin = cJSON_IsNumber(lp) ? lp->valueint : LUNG_PIN_MIN;   // pagine del giro 2: 4
         uint8_t chiave[32], g[32];
         if (!ponte || strncmp(ponte, "https://", 8) != 0 || strlen(ponte) > 150) errore("ponte");
         else if (!esa(gettone, g, 32)) errore("gettone");
         else if (!esa(chiave_hex, chiave, 32)) errore("chiave");
-        else if (!memoria_abbina(ponte, gettone, chiave)) errore("memoria");
+        else if (lung_pin < LUNG_PIN_MIN || lung_pin > LUNG_PIN_MAX) errore("lung_pin");
+        else if (!memoria_abbina(ponte, gettone, chiave, lung_pin)) errore("memoria");
         else { cJSON *r = cJSON_CreateObject(); cJSON_AddTrueToObject(r, "ok"); rispondi(r); if (avvisa) avvisa(); }
         memset(chiave, 0, sizeof chiave);
         memset(g, 0, sizeof g);

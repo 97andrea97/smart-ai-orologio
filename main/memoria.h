@@ -17,7 +17,11 @@ void memoria_avvia(void);
 
 bool memoria_abbinato(void);
 // Abbinamento: sostituisce ponte, gettone e chiave, azzera i contatori.
-bool memoria_abbina(const char *ponte, const char *gettone_hex, const uint8_t chiave[32]);
+// lung_pin: quante cifre ha il PIN (lo decide il PC, giro 3); fuori da LUNG_PIN_MIN..LUNG_PIN_MAX si rifiuta.
+bool memoria_abbina(const char *ponte, const char *gettone_hex, const uint8_t chiave[32], int lung_pin);
+#define LUNG_PIN_MIN 4
+#define LUNG_PIN_MAX 8
+int memoria_lung_pin(void);   // LUNG_PIN_MIN se non salvata
 bool memoria_ponte(char *url, size_t cap);
 bool memoria_gettone(char *hex, size_t cap);
 bool memoria_chiave(uint8_t chiave[32]);

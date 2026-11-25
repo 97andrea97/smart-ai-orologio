@@ -41,8 +41,9 @@ bool memoria_abbinato(void)
     return memoria_chiave(k) && memoria_gettone(g, sizeof g);
 }
 
-bool memoria_abbina(const char *ponte, const char *gettone_hex, const uint8_t chiave[32])
+bool memoria_abbina(const char *ponte, const char *gettone_hex, const uint8_t chiave[32], int lung_pin)
 {
+    if (lung_pin < LUNG_PIN_MIN || lung_pin > LUNG_PIN_MAX) return false;
     nvs_handle_t h;
     if (!apri(NVS_READWRITE, &h)) return false;
     bool ok = nvs_set_str(h, "ponte", ponte) == ESP_OK
@@ -50,10 +51,19 @@ bool memoria_abbina(const char *ponte, const char *gettone_hex, const uint8_t ch
         && nvs_set_blob(h, "chiave", chiave, 32) == ESP_OK
         && nvs_set_u64(h, "contatore", 0) == ESP_OK
         && nvs_set_u64(h, "visto_pc", 0) == ESP_OK
+        && nvs_set_u8(h, "lung_pin", (uint8_t)lung_pin) == ESP_OK
         && nvs_commit(h) == ESP_OK;
     nvs_close(h);
     ESP_LOGI(TAG, "abbinamento %s", ok ? "salvato" : "NON salvato");
     return ok;
+}
+
+int memoria_lung_pin(void)
+{
+    nvs_handle_t h;
+    uint8_t n = 0;
+    if (apri(NVS_READONLY, &h)) { nvs_get_u8(h, "lung_pin", &n); nvs_close(h); }
+    return (n >= LUNG_PIN_MIN && n <= LUNG_PIN_MAX) ? n : LUNG_PIN_MIN;
 }
 
 bool memoria_ponte(char *url, size_t cap) { return leggi_testo("ponte", url, cap); }

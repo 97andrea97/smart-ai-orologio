@@ -1,6 +1,7 @@
 // smart-AI, firmware dell'orologio Waveshare ESP32-S3-Touch-AMOLED-2.06.
 //
 // Giro 2 (24/11/2026): abbinamento col cavo (seriale.c), wifi e ponte (rete.c), PIN sul tastierino.
+// Giro 3 (25/11/2026): aggiornamento via wifi (aggiorna.c) e lunghezza del PIN decisa dal PC.
 // Nessun segreto nel codice: wifi, indirizzo del ponte, gettone e chiave delle buste li scrive la
 // pagina Orologio dell'app attraverso il cavo, e restano nella memoria dell'orologio (memoria.c).
 // Il PIN non resta nell'orologio: va al PC dentro una busta cifrata, il PC lo confronta con l'impronta.
@@ -23,20 +24,22 @@
 #include "memoria.h"
 #include "rete.h"
 #include "seriale.h"
+#include "aggiorna.h"
+#include "esp_system.h"
 
 static const char *TAG = "smart-ai";
 
 // Motorino: piedino 18, mai acceso piu' di MOTORE_MAX_MS per volta (come VibrationTest di Waveshare).
 #define MOTORE        GPIO_NUM_18
 #define MOTORE_MAX_MS 250
-#define LUNG_PIN      4
 
 static TaskHandle_t compito_motore = NULL;
 static QueueHandle_t richieste = NULL;     // messaggi JSON da spedire al PC, uno per volta
 
 static lv_obj_t *etichetta_stato, *etichetta_messaggio, *etichetta_pin, *tastierino, *riquadro_sbloccato;
-static char pin[LUNG_PIN + 1];
+static char pin[LUNG_PIN_MAX + 1];
 static int cifre = 0;
+static int lung_pin = LUNG_PIN_MIN;   // dalla memoria: la decide il PC all'abbinamento
 static bool sbloccato = false;
 
 typedef struct { char json[96]; } richiesta_t;
@@ -70,8 +73,8 @@ static void visibile(lv_obj_t *o, bool si)
 
 static void mostra_pin_bloccato(void)
 {
-    char puntini[LUNG_PIN * 2 + 1] = { 0 };
-    for (int i = 0; i < LUNG_PIN; i++) strcat(puntini, i < cifre ? "* " : "_ ");
+    char puntini[LUNG_PIN_MAX * 2 + 1] = { 0 };
+    for (int i = 0; i < lung_pin; i++) strcat(puntini, i < cifre ? "* " : "_ ");
     lv_label_set_text(etichetta_pin, puntini);
 }
 
@@ -104,6 +107,7 @@ static void messaggio(const char *testo)
 
 static void cambiato_dal_cavo(void)
 {
+    lung_pin = memoria_lung_pin();
     bsp_display_lock(0);
     aggiorna_bloccato();
     bsp_display_unlock();
@@ -118,7 +122,7 @@ static void spedisci(const char *json)
     memset(r.json, 0, sizeof r.json);
 }
 
-// Tastierino: cifre, C per cancellare, OK quando le cifre sono 6. Callback di LVGL: blocco gia' preso.
+// Tastierino: cifre, C per cancellare, OK quando le cifre sono lung_pin. Callback di LVGL: blocco gia' preso.
 static void tasto(lv_event_t *e)
 {
     lv_obj_t *t = (lv_obj_t *)lv_event_get_target(e);
@@ -128,16 +132,16 @@ static void tasto(lv_event_t *e)
     if (strcmp(testo, "C") == 0) {
         cifre = 0;
     } else if (strcmp(testo, "OK") == 0) {
-        if (cifre != LUNG_PIN) { lv_label_set_text(etichetta_messaggio, "Il PIN e' di 4 cifre"); return; }
+        if (cifre != lung_pin) { lv_label_set_text_fmt(etichetta_messaggio, "Il PIN e' di %d cifre", lung_pin); return; }
         char json[64];
-        pin[LUNG_PIN] = 0;
+        pin[cifre] = 0;
         snprintf(json, sizeof json, "{\"t\":\"sblocca\",\"pin\":\"%s\"}", pin);
         memset(pin, 0, sizeof pin);
         cifre = 0;
         lv_label_set_text(etichetta_messaggio, "Controllo il PIN sul PC...");
         spedisci(json);
         memset(json, 0, sizeof json);
-    } else if (cifre < LUNG_PIN) {
+    } else if (cifre < lung_pin) {
         pin[cifre++] = testo[0];
     }
     mostra_pin_bloccato();
@@ -146,11 +150,22 @@ static void tasto(lv_event_t *e)
 static void tocco_stato(lv_event_t *e) { (void)e; vibra(30); lv_label_set_text(etichetta_messaggio, "Chiedo al PC..."); spedisci("{\"t\":\"stato\"}"); }
 static void tocco_blocca(lv_event_t *e) { (void)e; vibra(30); spedisci("{\"t\":\"blocca\"}"); }
 
+// Chiede al PC se c'e' un programma nuovo; il PC risponde con indirizzo, lunghezza e impronta.
+static void tocco_aggiorna(lv_event_t *e)
+{
+    (void)e;
+    vibra(30);
+    lv_label_set_text(etichetta_messaggio, "Chiedo al PC se c'e' un aggiornamento...");
+    char json[96];
+    snprintf(json, sizeof json, "{\"t\":\"aggiorna\",\"versione\":\"%.40s\"}", esp_app_get_description()->version);
+    spedisci(json);
+}
+
 static lv_obj_t *bottone(lv_obj_t *genitore, const char *testo, lv_event_cb_t cb)
 {
     lv_obj_t *b = lv_button_create(genitore);
-    lv_obj_set_size(b, 300, 90);
-    lv_obj_set_style_radius(b, 45, 0);
+    lv_obj_set_size(b, 300, 80);
+    lv_obj_set_style_radius(b, 40, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x1E4B5E), 0);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *s = lv_label_create(b);
@@ -197,19 +212,54 @@ static void disegna(void)
 
     riquadro_sbloccato = lv_obj_create(schermo);
     lv_obj_remove_style_all(riquadro_sbloccato);
-    lv_obj_set_size(riquadro_sbloccato, 380, 230);
+    lv_obj_set_size(riquadro_sbloccato, 380, 300);
     lv_obj_align(riquadro_sbloccato, LV_ALIGN_BOTTOM_MID, 0, -40);
     lv_obj_set_flex_flow(riquadro_sbloccato, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(riquadro_sbloccato, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(riquadro_sbloccato, 24, 0);
+    lv_obj_set_style_pad_row(riquadro_sbloccato, 20, 0);
     bottone(riquadro_sbloccato, "Stato", tocco_stato);
     bottone(riquadro_sbloccato, "Blocca", tocco_blocca);
+    bottone(riquadro_sbloccato, "Aggiorna", tocco_aggiorna);
 
     mostra_pin_bloccato();
     aggiorna_bloccato();
 }
 
 // ---- dialogo col PC ----------------------------------------------------------------------------------
+
+static void avanzamento(int percento)
+{
+    char riga[48];
+    snprintf(riga, sizeof riga, "Scarico l'aggiornamento: %d%%", percento);
+    messaggio(riga);
+}
+
+// Risposta del PC a "aggiorna": gia' aperta e autenticata (busta del PC). Si scarica nel posto
+// libero; se l'impronta coincide si riavvia sul programma nuovo, che parte "in prova".
+static void aggiorna_da(cJSON *r, bool ok, const char *motivo)
+{
+    char riga[96];
+    if (!ok) {
+        if (strcmp(motivo, "gia_aggiornato") == 0) messaggio("Nessun aggiornamento: e' gia' l'ultima versione");
+        else if (strcmp(motivo, "bloccato") == 0) { sbloccato = false; messaggio("L'ora e' passata: inserisci il PIN"); }
+        else { snprintf(riga, sizeof riga, "Aggiornamento: il PC dice %s", motivo); messaggio(riga); }
+        vibra(60);
+        return;
+    }
+    cJSON *u = cJSON_GetObjectItemCaseSensitive(r, "url");
+    cJSON *d = cJSON_GetObjectItemCaseSensitive(r, "dim");
+    cJSON *s = cJSON_GetObjectItemCaseSensitive(r, "sha256");
+    if (!cJSON_IsString(u) || !cJSON_IsNumber(d) || d->valuedouble < 1 || !cJSON_IsString(s)) {
+        messaggio("Aggiornamento: risposta del PC non valida"); vibra(250); return;
+    }
+    messaggio("Scarico l'aggiornamento...");
+    aggiorna_esito_t e = aggiorna_scarica(u->valuestring, (size_t)d->valuedouble, s->valuestring, avanzamento);
+    if (e != AGGIORNA_OK) { messaggio(aggiorna_esito_testo(e)); vibra(250); return; }
+    messaggio("Aggiornato e verificato: riavvio");
+    vibra_due();
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
 
 static void gestisci_risposta(const char *inviato, const char *testo)
 {
@@ -227,6 +277,8 @@ static void gestisci_risposta(const char *inviato, const char *testo)
             messaggio(riga); vibra(250);
         } else if (strcmp(motivo, "scollegato") == 0) { messaggio("Tre PIN sbagliati: orologio scollegato, va riabbinato col cavo"); vibra(250); }
         else { snprintf(riga, sizeof riga, "Il PC dice: %s", motivo); messaggio(riga); }
+    } else if (strstr(inviato, "\"aggiorna\"")) {
+        aggiorna_da(r, ok, motivo);
     } else if (strstr(inviato, "\"blocca\"")) {
         sbloccato = false; messaggio("Bloccato. Inserisci il PIN"); vibra(60);
     } else {
@@ -245,7 +297,10 @@ static void dialogo(void *arg)
     for (;;) {
         xQueueReceive(richieste, &r, portMAX_DELAY);
         ponte_esito_t e = ponte_scambia(r.json, risposta, sizeof risposta);
-        if (e == PONTE_OK) gestisci_risposta(r.json, risposta);
+        if (e == PONTE_OK) {
+            aggiorna_conferma();   // il PC ha risposto: il programma nuovo funziona e resta
+            gestisci_risposta(r.json, risposta);
+        }
         else { messaggio(ponte_esito_testo(e)); vibra(250); }
         memset(&r, 0, sizeof r);
         memset(risposta, 0, sizeof risposta);
@@ -275,6 +330,7 @@ void app_main(void)
     xTaskCreate(motore, "motore", 2048, NULL, 5, &compito_motore);
 
     memoria_avvia();
+    lung_pin = memoria_lung_pin();
     richieste = xQueueCreate(4, sizeof(richiesta_t));
 
     bsp_display_start();
@@ -288,4 +344,11 @@ void app_main(void)
     xTaskCreate(ritocco, "ritocco", 3072, NULL, 2, NULL);
 
     vibra(200); // segno di vita all'accensione
+
+    // Programma appena arrivato via wifi: si prova subito a parlare col PC. Se risponde resta questo,
+    // altrimenti al prossimo riavvio (PWR) torna il precedente.
+    if (aggiorna_in_prova()) {
+        messaggio("Programma nuovo: controllo che parli col PC...");
+        spedisci("{\"t\":\"stato\"}");
+    }
 }

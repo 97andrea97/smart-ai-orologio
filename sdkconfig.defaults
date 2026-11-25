@@ -32,3 +32,7 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Giro 3: aggiornamento via wifi. Un programma nuovo parte "in prova": se non si dichiara buono
+# (aggiorna_conferma, dopo la prima risposta del PC) il riavvio successivo torna a quello vecchio.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

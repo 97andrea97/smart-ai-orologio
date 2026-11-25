@@ -1,6 +1,11 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-# Dall'esempio 02_lvgl_demo_v9 di Waveshare (memoria da 16 MB).
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, ,        8M,
-storage,  data, spiffs,  ,        7M,
+# Name,   Type, SubType, Offset,   Size, Flags
+# Giro 3 (25/11/2026): due posti per il programma (ota_0, ota_1) per l'aggiornamento via wifi.
+# Si scrive nel posto libero, si controlla l'impronta, e solo allora si avvia da li'; se il programma
+# nuovo non arriva a parlare col PC, al riavvio successivo torna quello vecchio (aggiorna.c).
+# nvs resta allo stesso indirizzo del giro 2. Memoria da 16 MB, come l'esempio di Waveshare.
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  6M,
+ota_1,    app,  ota_1,   ,         6M,
+storage,  data, spiffs,  ,         3M,
