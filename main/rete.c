@@ -10,6 +10,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_netif_sntp.h"
@@ -31,6 +32,61 @@ static SemaphoreHandle_t scambio;            // un messaggio per volta, come il 
 static rete_t reti[MAX_RETI];
 static int n_reti = 0, rete_corrente = 0;
 static volatile rete_fase_t fase = RETE_SPENTA;
+static esp_netif_t *netif_sta = NULL;
+
+// Il motivo vero dell'ultimo "errore di rete" (26/11/2026): su una rete diversa dall'hotspot l'orologio diceva solo
+// "Errore di rete" e non si capiva dove si fermava. Tre righe corte per lo schermo: fase (DNS, connessione, tempo
+// scaduto, TLS, HTTP, risposta, busta, memoria) e codice; IP e DNS ricevuti dalla rete; ora e memoria interna libera.
+// Mai il gettone ne' l'indirizzo del ponte. Si azzera a ogni scambio; lo legge ponte_esito_testo(PONTE_ERRORE).
+static char motivo[128];
+
+static void segna_motivo(const char *fase_rete, const char *dettaglio)
+{
+    char ip[32] = "-", dns[32] = "-", ora[16] = "--:--";   // larghi: niente avvisi di troncamento (-Werror)
+    esp_netif_ip_info_t info;
+    if (netif_sta && esp_netif_get_ip_info(netif_sta, &info) == ESP_OK) snprintf(ip, sizeof ip, IPSTR, IP2STR(&info.ip));
+    esp_netif_dns_info_t d;
+    if (netif_sta && esp_netif_get_dns_info(netif_sta, ESP_NETIF_DNS_MAIN, &d) == ESP_OK && d.ip.type == ESP_IPADDR_TYPE_V4) {
+        snprintf(dns, sizeof dns, IPSTR, IP2STR(&d.ip.u_addr.ip4));
+    }
+    time_t adesso = time(NULL);
+    struct tm t;
+    localtime_r(&adesso, &t);
+    if (t.tm_year + 1900 >= 2025) snprintf(ora, sizeof ora, "%02d:%02d", t.tm_hour, t.tm_min);
+    snprintf(motivo, sizeof motivo, "Rete, %s: %s\nIP %s DNS %s\nora %s, memoria %uk", fase_rete, dettaglio, ip, dns, ora,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    ESP_LOGW(TAG, "%s", motivo);
+}
+
+// Dopo una chiamata fallita sotto l'HTTP: errno della presa e ultimo errore di esp-tls (codice ESP, codice mbedtls,
+// difetti del certificato). La fase si ricava dal nome dell'errore di esp-tls; `fase_rete` la impone (invio, risposta).
+static void segna_trasporto(esp_http_client_handle_t cl, const char *fase_rete, esp_err_t aperta)
+{
+    int sock_errno = esp_http_client_get_errno(cl);   // prima: l'altra chiamata azzera l'errore di esp-tls
+    int tls_codice = 0, cert = 0;
+    esp_err_t tls = esp_http_client_get_and_clear_last_tls_error(cl, &tls_codice, &cert);
+    if (tls == ESP_ERR_INVALID_STATE) tls = ESP_OK;   // nessun registro degli errori: come nessun errore
+    esp_err_t principale = tls != ESP_OK ? tls : aperta;
+    const char *nome = principale != ESP_OK ? esp_err_to_name(principale) : "nessun codice";
+    if (!fase_rete) {
+        if (tls == ESP_OK) fase_rete = "connessione";
+        else if (strstr(nome, "RESOLVE")) fase_rete = "DNS";
+        else if (strstr(nome, "TIMEOUT")) fase_rete = "tempo scaduto";
+        else if (strstr(nome, "SOCKET") || strstr(nome, "CONNECT")) fase_rete = "connessione";
+        else fase_rete = "TLS";
+    }
+    // Nomi piu' corti per lo schermo: ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME -> TLS_CANNOT_RESOLVE_HOSTNAME.
+    if (strncmp(nome, "ESP_ERR_ESP_", 12) == 0) nome += 12;
+    else if (strncmp(nome, "ESP_ERR_", 8) == 0) nome += 8;
+    char dettaglio[80];
+    int n = snprintf(dettaglio, sizeof dettaglio, "%s", nome);
+    if (tls_codice && n > 0 && n < (int)sizeof dettaglio) {
+        n += snprintf(dettaglio + n, sizeof dettaglio - n, " -0x%04X", (unsigned)(tls_codice < 0 ? -tls_codice : tls_codice));
+    }
+    if (cert && n > 0 && n < (int)sizeof dettaglio) n += snprintf(dettaglio + n, sizeof dettaglio - n, " cert 0x%X", (unsigned)cert);
+    if (sock_errno > 0 && n > 0 && n < (int)sizeof dettaglio) snprintf(dettaglio + n, sizeof dettaglio - n, " errno %d", sock_errno);
+    segna_motivo(fase_rete, dettaglio);
+}
 
 static void prova_rete(int i)
 {
@@ -76,7 +132,7 @@ void rete_avvia(void)
     esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_netif_sntp_init(&sntp);
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    netif_sta = esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &evento, NULL, NULL));
@@ -128,21 +184,22 @@ static int sigilla(const uint8_t chiave[32], uint64_t contatore, const char *jso
 }
 
 // Apre una busta del PC: direzione giusta, contatore mai visto, sigillo valido. JSON in `testo`.
+// Se la rifiuta, il perche' va nel motivo (fase "busta").
 static bool apri(const uint8_t chiave[32], const uint8_t *busta, int lung, char *testo, size_t cap)
 {
-    if (lung < 29 || busta[0] != DIR_PC) return false;
+    if (lung < 29 || busta[0] != DIR_PC) { segna_motivo("busta", "forma non valida"); return false; }
     uint64_t contatore = 0;
     for (int i = 0; i < 8; i++) contatore = (contatore << 8) | busta[4 + i];
-    if (contatore <= memoria_visto_pc()) return false;      // ripetuta
+    if (contatore <= memoria_visto_pc()) { segna_motivo("busta", "contatore gia' visto"); return false; }   // ripetuta
     size_t corpo = (size_t)lung - 28;
-    if (corpo + 1 > cap) return false;
+    if (corpo + 1 > cap) { segna_motivo("busta", "troppo grande"); return false; }
     mbedtls_gcm_context g;
     mbedtls_gcm_init(&g);
     int e = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, chiave, 256);
     if (e == 0) e = mbedtls_gcm_auth_decrypt(&g, corpo, busta, 12, NULL, 0, busta + lung - 16, 16,
                                              busta + 12, (uint8_t *)testo);
     mbedtls_gcm_free(&g);
-    if (e != 0) return false;
+    if (e != 0) { segna_motivo("busta", "sigillo non valido"); return false; }
     testo[corpo] = 0;
     memoria_imposta_visto_pc(contatore);
     return true;
@@ -162,19 +219,26 @@ static int chiama(const char *url, const char *gettone, esp_http_client_method_t
         .timeout_ms = 15000,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
+    *letti = 0;
     esp_http_client_handle_t cl = esp_http_client_init(&c);
-    if (!cl) return -1;
+    if (!cl) { segna_motivo("memoria", "client HTTP non creato"); return -1; }
     esp_http_client_set_header(cl, "Authorization", autorizzazione);
     if (corpo) esp_http_client_set_header(cl, "Content-Type", "application/octet-stream");
     int stato = -1;
-    *letti = 0;
-    if (esp_http_client_open(cl, corpo ? lung : 0) == ESP_OK) {
+    // Ogni strada che finisce senza stato HTTP lascia il motivo (segna_trasporto): fase e codici, non solo "errore".
+    esp_err_t aperta = esp_http_client_open(cl, corpo ? lung : 0);
+    if (aperta == ESP_OK) {
         if (!corpo || esp_http_client_write(cl, (const char *)corpo, lung) == lung) {
             esp_http_client_fetch_headers(cl);
             stato = esp_http_client_get_status_code(cl);
+            if (stato <= 0) segna_trasporto(cl, "risposta", ESP_OK);
             int n = esp_http_client_read_response(cl, (char *)fuori, cap);
             *letti = n > 0 ? n : 0;
+        } else {
+            segna_trasporto(cl, "invio", ESP_OK);
         }
+    } else {
+        segna_trasporto(cl, NULL, aperta);
     }
     esp_http_client_close(cl);
     esp_http_client_cleanup(cl);
@@ -190,7 +254,7 @@ const char *ponte_esito_testo(ponte_esito_t e)
         case PONTE_PC_SPENTO: return "Il PC non e' collegato";
         case PONTE_RIFIUTATO: return "Orologio non riconosciuto: va riabbinato";
         case PONTE_NESSUNA_RISPOSTA: return "Il PC non ha risposto";
-        default: return "Errore di rete";
+        default: return motivo[0] ? motivo : "Errore di rete";
     }
 }
 
@@ -216,30 +280,41 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
     if (!rete_attendi(20000)) return PONTE_SENZA_RETE;
 
     xSemaphoreTake(scambio, portMAX_DELAY);
+    motivo[0] = 0;
     ponte_esito_t esito = PONTE_ERRORE;
+    char riga[48];
     // La busta e' grande quanto il messaggio; quella di risposta quanto `cap` (piu' nonce e sigillo), mai meno di MAX_BUSTA.
     size_t cap_busta = 12 + lung_json + 16;
     size_t cap_dati = cap + 28 + 1 > MAX_BUSTA ? cap + 28 + 1 : MAX_BUSTA;
     uint8_t *busta = cap_busta > MAX_BUSTA ? alloca_grande(cap_busta) : malloc(cap_busta);
     uint8_t *dati = cap_dati > MAX_BUSTA ? alloca_grande(cap_dati) : malloc(cap_dati);
-    if (!busta || !dati) { ESP_LOGW(TAG, "memoria per la busta: %u byte", (unsigned)cap_busta); goto fine; }
+    if (!busta || !dati) {
+        ESP_LOGW(TAG, "memoria per la busta: %u byte", (unsigned)cap_busta);
+        segna_motivo("memoria", "busta non allocata");
+        goto fine;
+    }
 
     uint64_t contatore = memoria_contatore_nuovo();   // salvato prima di spedire
-    if (contatore == 0) goto fine;
+    if (contatore == 0) { segna_motivo("memoria", "contatore non salvato"); goto fine; }
     int lung = sigilla(chiave, contatore, json, lung_json, busta, cap_busta);
-    if (lung < 0) goto fine;
+    if (lung < 0) { segna_motivo("busta", "cifratura non riuscita"); goto fine; }
 
     int letti = 0;
     snprintf(url, sizeof url, "%s/o/invia", base);
     int stato = chiama(url, gettone, HTTP_METHOD_POST, busta, lung, dati, MAX_BUSTA - 1, &letti);
     if (stato == 503) { esito = PONTE_PC_SPENTO; goto fine; }
     if (stato == 401) { esito = PONTE_RIFIUTATO; goto fine; }
-    if (stato != 200) { ESP_LOGW(TAG, "/o/invia: %d", stato); goto fine; }
+    if (stato != 200) {
+        ESP_LOGW(TAG, "/o/invia: %d", stato);
+        // stato <= 0: chiama() ha gia' scritto il motivo (DNS, connessione, TLS...).
+        if (stato > 0) { snprintf(riga, sizeof riga, "invio, stato %d", stato); segna_motivo("HTTP", riga); }
+        goto fine;
+    }
     dati[letti] = 0;
     // {"id":"<uuid>"}: basta trovare il valore fra virgolette dopo "id"
     char *p = strstr((char *)dati, "\"id\"");
     char id[64] = { 0 };
-    if (!p || sscanf(p, "\"id\":\"%63[^\"]\"", id) != 1) goto fine;
+    if (!p || sscanf(p, "\"id\":\"%63[^\"]\"", id) != 1) { segna_motivo("risposta", "invio senza id"); goto fine; }
     if (!attendi) { esito = PONTE_OK; goto fine; }
 
     snprintf(url, sizeof url, "%s/o/risposta?id=%s", base, id);
@@ -251,7 +326,11 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
             break;
         }
         if (stato == 401) { esito = PONTE_RIFIUTATO; break; }
-        if (stato != 204) { esito = PONTE_ERRORE; break; }
+        if (stato != 204) {
+            if (stato > 0) { snprintf(riga, sizeof riga, "attesa, stato %d", stato); segna_motivo("HTTP", riga); }
+            esito = PONTE_ERRORE;
+            break;
+        }
         vTaskDelay(pdMS_TO_TICKS(PASSO_RISPOSTA_MS));
     }
 fine:
