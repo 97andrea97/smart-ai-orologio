@@ -47,6 +47,10 @@ static QueueHandle_t richieste = NULL;     // messaggi JSON da spedire al PC, un
 
 static lv_obj_t *etichetta_ora, *etichetta_stato, *etichetta_messaggio, *riquadro_sbloccato;
 static lv_obj_t *pannello_voce = NULL, *testo_voce = NULL;   // trascritto e risposta, scorrevole, con Chiudi
+// Prova dell'altoparlante (26/11/2026): il tasto "Prova suono" sta sempre in vista, anche da bloccato, e il suo esito va nello stesso
+// pannello. Da bloccato il pannello si richiudeva da solo (aggiorna_bloccato): con pannello_fisso resta fino a Chiudi.
+static volatile bool pannello_fisso = false;
+static volatile bool prova_suono_richiesta = false;
 // Gesto di sblocco (25/11/2026, al posto del PIN): 9 punti su quasi tutto lo schermo, come lo sblocco di Android. Il gesto
 // e' la sequenza dei punti toccati (1-9 per righe, dall'alto a sinistra): un punto puo' tornare, ma non due volte di fila;
 // da GESTO_MIN a GESTO_MAX punti (regola del PC, pc\gesto.mjs);
@@ -139,7 +143,7 @@ static void aggiorna_bloccato(void)
     }
     visibile(griglia, abbinato && !sbloccato);
     visibile(riquadro_sbloccato, abbinato && sbloccato);
-    if (pannello_voce && !(abbinato && sbloccato)) visibile(pannello_voce, false);
+    if (pannello_voce && !(abbinato && sbloccato) && !pannello_fisso) visibile(pannello_voce, false);
 }
 
 static void accendi_bloccato(void)
@@ -187,7 +191,20 @@ static void mostra_voce(const char *testo, bool sveglia)
 }
 
 static volatile bool ferma_ascolto = false;   // la risposta letta (piu' sotto, "risposta a voce"): Chiudi la ferma
-static void tocco_chiudi_voce(lv_event_t *e) { (void)e; ferma_ascolto = true; visibile(pannello_voce, false); }   // callback di LVGL: blocco gia' preso
+static void tocco_chiudi_voce(lv_event_t *e) { (void)e; ferma_ascolto = true; pannello_fisso = false; visibile(pannello_voce, false); }   // callback di LVGL: blocco gia' preso
+
+// Tasto "Prova suono" (callback di LVGL, blocco gia' preso): il tono lo suona il compito dell'audio (parla), lo stesso che registra
+// e ascolta, cosi' non si sovrappone a loro. Qui solo la richiesta e il pannello aperto subito, per vedere che il tocco e' arrivato.
+static void tocco_prova_suono(lv_event_t *e)
+{
+    (void)e;
+    vibra(30);
+    pannello_fisso = true;
+    lv_label_set_text(testo_voce, "Prova suono: tra un attimo senti un tono (1000 Hz, 1 secondo)...");
+    visibile(pannello_voce, true);
+    lv_obj_scroll_to_y(pannello_voce, 0, LV_ANIM_OFF);
+    prova_suono_richiesta = true;
+}
 
 static void cambiato_dal_cavo(void)
 {
@@ -309,6 +326,19 @@ static void disegna(void)
     lv_obj_set_style_text_font(etichetta_ora, &lv_font_montserrat_48, 0);
     lv_label_set_text(etichetta_ora, "--:--");
     lv_obj_align(etichetta_ora, LV_ALIGN_TOP_MID, 0, 32);
+
+    // Prova suono (26/11/2026): in alto a sinistra, accanto all'ora, sempre in vista (da bloccato e da sbloccato, anche non abbinato):
+    // la griglia del gesto comincia piu' in basso e non si tocca. Colore diverso dagli altri tasti perche' e' una prova, non un comando.
+    lv_obj_t *prova = lv_button_create(schermo);
+    lv_obj_set_size(prova, 124, 46);
+    lv_obj_align(prova, LV_ALIGN_TOP_LEFT, 10, 38);
+    lv_obj_set_style_radius(prova, 23, 0);
+    lv_obj_set_style_bg_color(prova, lv_color_hex(0x9A5B12), 0);
+    lv_obj_add_event_cb(prova, tocco_prova_suono, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *prova_testo = lv_label_create(prova);
+    lv_label_set_text(prova_testo, "Prova suono");
+    lv_obj_set_style_text_font(prova_testo, &lv_font_montserrat_16, 0);
+    lv_obj_center(prova_testo);
 
     etichetta_messaggio = lv_label_create(schermo);
     lv_obj_set_width(etichetta_messaggio, 370);
@@ -555,6 +585,7 @@ static void rifiuto_voce(const char *motivo)
 // BOOT tenuto giu' registra subito un messaggio nuovo (il giro di `parla` vede il tasto premuto).
 // ferma_ascolto e' dichiarato accanto a tocco_chiudi_voce, che lo accende.
 static bool ascolto_fermato = false;
+static unsigned secondi_voce = 0;   // lunghezza della risposta letta, per la riga che dice che ha suonato
 
 static bool continua_ascolto(void)
 {
@@ -614,6 +645,7 @@ static const char *ascolta_risposta(void)
     }
     free(buf);   // prima di suonare: 256 KB di PSRAM tornano liberi
     if (!esito && !ascolto_fermato && pcm) {
+        secondi_voce = (unsigned)(campioni / VOCE_HZ);
         if (!voce_riproduci(pcm, campioni, continua_ascolto)) esito = "altoparlante non disponibile";
         else if (tagliata && !ascolto_fermato) esito = "voce tagliata: il resto e' nell'app";
     }
@@ -629,8 +661,11 @@ static void ascolta(void)
     snprintf(schermo_voce + base, cap - base, "\n\n(voce in arrivo...)");
     mostra_voce(schermo_voce, false);
     const char *esito = ascolta_risposta();
+    // 26/11/2026: anche l'esito buono lascia una riga. Prima, quando la voce era suonata davvero e non si sentiva niente, lo
+    // schermo era identico al caso in cui il PC non l'aveva mandata: non si capiva dove cercare.
     if (esito) snprintf(schermo_voce + base, cap - base, "\n\n(%.80s)", esito);
-    else schermo_voce[base] = 0;
+    else if (ascolto_fermato) snprintf(schermo_voce + base, cap - base, "\n\n(voce interrotta)");
+    else snprintf(schermo_voce + base, cap - base, "\n\n(voce suonata, %u s)", secondi_voce);
     mostra_voce(schermo_voce, false);
 }
 
@@ -670,11 +705,21 @@ static bool chiedi_stato_voce(char *risposta)
     snprintf(schermo_voce, RISPOSTA_VOCE_CAP + 64, "%s%s%s%s%s",
              cJSON_IsString(t) ? "Tu: " : "", cJSON_IsString(t) ? t->valuestring : "", cJSON_IsString(t) ? "\n\n" : "",
              con_risposta ? ri->valuestring : cJSON_IsString(n) ? n->valuestring : "", riga_file);
+    // 26/11/2026: con la risposta pronta, e se il PC la ha letta e Silenzioso e' spento, la si ascolta dall'altoparlante.
+    // Quando non si ascolta, lo schermo dice perche' (prima non diceva niente, e "il PC non la manda" non si distingueva da
+    // "l'altoparlante e' muto").
+    cJSON *parla_pc = cJSON_GetObjectItemCaseSensitive(r, "parla");
+    bool parla = fine && con_risposta && cJSON_IsTrue(parla_pc);
+    if (fine && con_risposta && !parla) {
+        const size_t cap = RISPOSTA_VOCE_CAP + 64, base = strlen(schermo_voce);
+        const char *perche = !parla_pc ? "il PC non dice parla: riavvia il servizio"
+                           : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "audio")) ? "Silenzioso acceso nelle Impostazioni"
+                           : "la voce non e' pronta sul PC";
+        snprintf(schermo_voce + base, cap - base, "\n\n(senza voce: %s)", perche);
+    }
     mostra_voce(schermo_voce, fine);
     if (fine) { if (con_risposta) vibra_due(); else vibra(60); }
     else riprova_voce = riprova_da(r);
-    // 26/11/2026: con la risposta pronta, e se il PC la ha letta e Silenzioso e' spento, la si ascolta dall'altoparlante.
-    bool parla = fine && con_risposta && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "parla"));
     cJSON_Delete(r);
     if (parla) ascolta();
     return !fine;
@@ -728,6 +773,42 @@ static bool registra_e_manda(char *risposta)
     return true;
 }
 
+// ---- prova dell'altoparlante (26/11/2026) ------------------------------------------------------------------
+// Un tono generato qui (voce_prova_suono), senza PC, wifi, ponte ne' sblocco: suona una volta all'avvio e ogni volta che si tocca
+// "Prova suono". L'esito del pilota resta nel pannello fino a Chiudi. Scelta nostra e temporanea: finche' non si sa che
+// l'altoparlante funziona; poi PROVA_SUONO_ALL_AVVIO si mette a 0 (a ogni riavvio, anche dopo un aggiornamento, il tono si sente).
+#define PROVA_SUONO_ALL_AVVIO     1
+// All'avvio il tono aspetta il wifi, e se il programma e' appena arrivato (in prova) anche la prima risposta del PC: aprire l'I2S
+// prende circa 17 KB di memoria interna (vedi LEZIONI, microfoni) e non deve contendersi la memoria con la prima connessione sicura,
+// che dichiara buono il programma nuovo (25/11/2026: con il bus aperto prima del wifi un programma non arrivava a parlare col PC).
+// Senza wifi suona lo stesso dopo PROVA_AVVIO_ATTESA_MAX_MS: tempo di chi aspetta davanti all'orologio, assoluto.
+#define PROVA_AVVIO_DOPO_MS       3000
+#define PROVA_AVVIO_ATTESA_MAX_MS 45000
+static bool prova_avvio_fatta = false;
+static char esito_prova[360];
+
+static bool prova_avvio_pronta(void)
+{
+    if (!PROVA_SUONO_ALL_AVVIO || prova_avvio_fatta) return false;
+    // aggiorna_in_prova() legge lo stato dell'immagine dalla flash: si guarda ogni mezzo secondo, non a ogni giro del compito (10 ms).
+    static uint32_t ultimo_controllo = 0;
+    uint32_t t = adesso_ms();
+    if (t < PROVA_AVVIO_DOPO_MS || t - ultimo_controllo < 500) return false;
+    ultimo_controllo = t;
+    if (rete_fase() == RETE_COLLEGATA && !aggiorna_in_prova()) return true;
+    return t >= PROVA_AVVIO_ATTESA_MAX_MS;
+}
+
+static void esegui_prova_suono(void)
+{
+    prova_avvio_fatta = true;
+    pannello_fisso = true;
+    mostra_voce("Prova suono: tra un attimo senti un tono (1000 Hz, 1 secondo)...", true);
+    bool ok = voce_prova_suono(esito_prova, sizeof esito_prova);
+    mostra_voce(esito_prova, true);
+    vibra(ok ? 60 : 250);
+}
+
 static void parla(void *arg)
 {
     (void)arg;
@@ -741,6 +822,12 @@ static void parla(void *arg)
         bool ora = leggi_boot();
         bool premuto = ora && !prima;
         prima = ora;
+        // Prova suono (tasto sullo schermo o avvio): qui, nel compito che registra e ascolta, e mai con BOOT premuto per parlare.
+        if (!ora && (prova_suono_richiesta || prova_avvio_pronta())) {
+            prova_suono_richiesta = false;
+            esegui_prova_suono();
+            continue;
+        }
         if (!premuto) {
             // Intanto, se c'e' un messaggio in corso, ne chiede lo stato quando e' il momento.
             if (segui && (int32_t)(adesso_ms() - prossima) >= 0) {

@@ -2,6 +2,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <math.h>
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_random.h"
@@ -140,6 +143,121 @@ bool voce_riproduci(const int16_t *pcm, size_t campioni, bool (*continua)(void))
     esp_codec_dev_close(microfoni);
     esp_codec_dev_close(altoparlante);
     ESP_LOGI(TAG, "letti %u campioni su %u%s", (unsigned)n, (unsigned)campioni, ok ? "" : ", scrittura fallita");
+    return ok;
+}
+
+// ---- prova dell'altoparlante (26/11/2026) -----------------------------------------------------------------
+// Sul polso la risposta si leggeva ma l'altoparlante restava muto, e non c'era modo di sapere se il difetto stava nella
+// scheda o nel percorso della risposta (il successo di voce_riproduci non lascia traccia sullo schermo). Qui un tono fisso,
+// senza PC: stessa sequenza di apertura di voce_riproduci (uscita stereo, poi ingresso a 4 posti, volume, mute spento),
+// piu' la lettura di cio' che il pilota ha davvero impostato. Il PA e' il piedino dell'amplificatore NS4150B (BSP_POWER_AMP_IO,
+// GPIO46): letto come fa il firmware di fabbrica (bsp_extra_codec_pa_is_enabled), cioe' abilitando l'ingresso del piedino
+// senza toccare l'uscita, perche' gpio_get_level() con l'ingresso spento torna sempre 0.
+#define PROVA_HZ        1000     // il tono; VOCE_HZ / PROVA_HZ campioni per periodo, intero: nessun salto fra un periodo e l'altro
+#define PROVA_MS        1000
+#define PROVA_AMPIEZZA  20000    // su 32767: circa il 61% del fondo scala
+#define PROVA_RAMPA_MS  10       // entrata e uscita dolci: niente "clic" ai due estremi
+// Volume del tono (0-100, esp_codec_dev_set_out_vol): quello dell'esempio ES8311 di Waveshare per la stessa scheda
+// (08_ES8311.ino, EXAMPLE_VOICE_VOLUME 85), piu' alto dei 70 della risposta letta: la prova deve sentirsi bene.
+#define PROVA_VOLUME    85
+_Static_assert(VOCE_HZ % PROVA_HZ == 0, "il tono deve avere un numero intero di campioni per periodo");
+#define PROVA_PERIODO   (VOCE_HZ / PROVA_HZ)
+
+#define ES8311_REG_MUTE     0x31   // bit 6 e 5: mute del DAC (00 = acceso)
+#define ES8311_REG_VOLUME   0x32
+#define ES8311_REG_DAC      0x12   // 00 = DAC acceso
+#define ES8311_REG_ID1      0xFD
+#define ES8311_REG_ID2      0xFE
+
+// Accoda una riga di testo in `buf` senza uscire dal suo posto.
+static void aggiungi(char *buf, size_t cap, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void aggiungi(char *buf, size_t cap, const char *fmt, ...)
+{
+    size_t n = strlen(buf);
+    if (n + 1 >= cap) return;
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(buf + n, cap - n, fmt, a);
+    va_end(a);
+}
+
+// Un registro dell'ES8311 come due cifre esadecimali, "--" se non si e' potuto leggere.
+static void registro(char *testo, int reg)
+{
+    int v = -1;
+    if (esp_codec_dev_read_reg(altoparlante, reg, &v) != ESP_CODEC_DEV_OK || v < 0) strcpy(testo, "--");
+    else snprintf(testo, 3, "%02x", v & 0xFF);
+}
+
+bool voce_prova_suono(char *esito, size_t cap)
+{
+    esito[0] = 0;
+    if (!voce_avvia()) {
+        aggiungi(esito, cap, "Suono NON inviato\nbus: %s", voce_errore());
+        return false;
+    }
+    esp_codec_dev_sample_info_t uscita = { .sample_rate = VOCE_HZ, .channel = 2, .bits_per_sample = 16 };
+    esp_codec_dev_sample_info_t ingresso = {
+        .sample_rate = VOCE_HZ, .channel = POSTI_TDM, .channel_mask = POSTI_TUTTI, .bits_per_sample = 16,
+    };
+    const int r_uscita = esp_codec_dev_open(altoparlante, &uscita);
+    if (r_uscita != ESP_CODEC_DEV_OK) {
+        aggiungi(esito, cap, "Suono NON inviato\napertura uscita: %d %s", r_uscita, esp_err_to_name((esp_err_t)r_uscita));
+        return false;
+    }
+    esp_codec_dev_set_out_mute(altoparlante, true);
+    const int r_mic = esp_codec_dev_open(microfoni, &ingresso);
+    if (r_mic != ESP_CODEC_DEV_OK) {
+        esp_codec_dev_close(altoparlante);
+        aggiungi(esito, cap, "Suono NON inviato\napertura microfoni: %d %s", r_mic, esp_err_to_name((esp_err_t)r_mic));
+        return false;
+    }
+    const int r_vol = esp_codec_dev_set_out_vol(altoparlante, PROVA_VOLUME);
+    const int r_mute = esp_codec_dev_set_out_mute(altoparlante, false);
+
+    // Cio' che il pilota ha lasciato: piedino dell'amplificatore e registri del chip, letti con l'uscita aperta e il mute spento.
+    gpio_input_enable(BSP_POWER_AMP_IO);
+    const int pa = gpio_get_level(BSP_POWER_AMP_IO);
+    char id1[4], id2[4], r_m[4], r_v[4], r_d[4];
+    registro(id1, ES8311_REG_ID1);
+    registro(id2, ES8311_REG_ID2);
+    registro(r_m, ES8311_REG_MUTE);
+    registro(r_v, ES8311_REG_VOLUME);
+    registro(r_d, ES8311_REG_DAC);
+
+    int16_t onda[PROVA_PERIODO];   // un periodo del tono
+    for (int i = 0; i < PROVA_PERIODO; i++) onda[i] = (int16_t)(sinf(6.2831853f * (float)i / (float)PROVA_PERIODO) * PROVA_AMPIEZZA);
+    const size_t totale = (size_t)VOCE_HZ * PROVA_MS / 1000;
+    const size_t rampa = (size_t)VOCE_HZ * PROVA_RAMPA_MS / 1000;
+    size_t n = 0;
+    int r_scrittura = ESP_CODEC_DEV_OK;
+    while (n < totale && r_scrittura == ESP_CODEC_DEV_OK) {
+        const size_t k = totale - n < FRAME_USCITA ? totale - n : FRAME_USCITA;
+        for (size_t f = 0; f < k; f++) {
+            const size_t i = n + f;
+            const size_t bordo = i < totale - 1 - i ? i : totale - 1 - i;   // distanza dall'estremo piu' vicino
+            int32_t s = onda[i % PROVA_PERIODO];
+            if (bordo < rampa) s = s * (int32_t)bordo / (int32_t)rampa;
+            grezzo[2 * f] = grezzo[2 * f + 1] = (int16_t)s;
+        }
+        r_scrittura = esp_codec_dev_write(altoparlante, grezzo, (int)(k * 4));
+        if (r_scrittura == ESP_CODEC_DEV_OK) n += k;
+    }
+    memset(grezzo, 0, sizeof grezzo);
+    for (int g = 0; r_scrittura == ESP_CODEC_DEV_OK && g < GIRI_SILENZIO; g++) esp_codec_dev_write(altoparlante, grezzo, (int)sizeof grezzo);
+    esp_codec_dev_set_out_mute(altoparlante, true);
+    esp_codec_dev_close(microfoni);
+    esp_codec_dev_close(altoparlante);
+
+    const bool ok = r_vol == ESP_CODEC_DEV_OK && r_mute == ESP_CODEC_DEV_OK && r_scrittura == ESP_CODEC_DEV_OK && n == totale;
+    if (ok) aggiungi(esito, cap, "Suono inviato: %d Hz per %d s\n", PROVA_HZ, PROVA_MS / 1000);
+    else aggiungi(esito, cap, "Suono NON inviato del tutto (%u di %u campioni)\n", (unsigned)n, (unsigned)totale);
+    aggiungi(esito, cap, "pilota: uscita %d, mic %d, volume %d, mute %d, scrittura %d\n", r_uscita, r_mic, r_vol, r_mute, r_scrittura);
+    aggiungi(esito, cap, "amplificatore (PA, piedino 46): %d\n", pa);
+    aggiungi(esito, cap, "ES8311 id %s %s, mute %s, volume %s, dac %s\n", id1, id2, r_m, r_v, r_d);
+    aggiungi(esito, cap, "Se non senti niente il difetto e' qui (altoparlante o amplificatore), non nel PC.");
+    ESP_LOGI(TAG, "prova suono: pilota %d %d %d %d %d, PA %d, ES8311 id %s %s mute %s volume %s dac %s, campioni %u di %u",
+             r_uscita, r_mic, r_vol, r_mute, r_scrittura, pa, id1, id2, r_m, r_v, r_d, (unsigned)n, (unsigned)totale);
     return ok;
 }
 
