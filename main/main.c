@@ -32,6 +32,7 @@
 #include "aggiorna.h"
 #include "batteria.h"
 #include "voce.h"
+#include "telemetria.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "mbedtls/base64.h"
@@ -96,6 +97,13 @@ static lv_obj_t *velo = NULL;   // copre tutto a schermo spento: il primo tocco 
 static bool batt_in_carica = false;
 
 typedef struct { char json[96]; } richiesta_t;
+
+static uint32_t adesso_ms(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
+
+// Vero mentre l'orologio lavora per la voce (BOOT premuto, invio, attesa della risposta, scaricamento, ascolto) o suona la prova: la
+// telemetria (telemetria.c) aspetta che finisca, cosi' non apre connessioni mentre servono memoria e tempo ai microfoni e
+// all'altoparlante. Lo scrive solo il compito della voce (parla).
+static volatile bool voce_occupata = false;
 
 // ---- motorino --------------------------------------------------------------------------------------
 
@@ -180,11 +188,18 @@ static void messaggio(const char *testo)
     bsp_display_unlock();
 }
 
+// Un errore sullo schermo, nella riga di messaggio: va anche al PC (telemetria.c), cosi' chi guarda l'orologio non deve riferirlo.
+static void errore_msg(const char *origine, const char *testo)
+{
+    telemetria_errore(origine, testo);
+    messaggio(testo);
+}
+
 // La fascia di stato della voce (registro, invio, attendo, errori): una zona piccola sopra il pannello, che lascia in vista l'ultima
 // risposta e i suoi tempi. `sveglia`: riaccende lo schermo. Il pannello non si apre e non si chiude: lo apre la risposta nuova.
-static void stato_voce(const char *testo, bool sveglia)
+__attribute__((noinline)) static void stato_voce(const char *testo, bool sveglia)   // noinline: niente analisi sulle stringhe fisse (-Werror)
 {
-    char riga[FASCIA_MAX_CAR + 1];
+    char riga[FASCIA_MAX_CAR + 1];   // cio' che la fascia non fa stare (l'errore intero) esce comunque verso il PC: errore_voce()
     const size_t n = strlen(testo);
     if (n > FASCIA_MAX_CAR) {
         memcpy(riga, testo, FASCIA_MAX_CAR - 3);
@@ -199,6 +214,13 @@ static void stato_voce(const char *testo, bool sveglia)
         lv_display_trigger_activity(NULL);
     }
     bsp_display_unlock();
+}
+
+// Un errore nella fascia di stato, e al PC con tutto il testo (la fascia ne mostra l'inizio).
+static void errore_voce(const char *origine, const char *testo)
+{
+    telemetria_errore(origine, testo);
+    stato_voce(testo, true);
 }
 
 // Il pannello della voce con la risposta. `sveglia`: riaccende lo schermo e mostra il pannello (risposta arrivata). Senza,
@@ -479,7 +501,7 @@ static void aggiorna_da(cJSON *r, bool ok, const char *motivo)
     if (!ok) {
         if (strcmp(motivo, "gia_aggiornato") == 0) messaggio("Nessun aggiornamento: e' gia' l'ultima versione");
         else if (strcmp(motivo, "bloccato") == 0) { sbloccato = false; messaggio("L'ora e' passata: disegna il gesto"); }
-        else { snprintf(riga, sizeof riga, "Aggiornamento: il PC dice %s", motivo); messaggio(riga); }
+        else { snprintf(riga, sizeof riga, "Aggiornamento: il PC dice %s", motivo); errore_msg("aggiorna", riga); }
         vibra(60);
         return;
     }
@@ -487,12 +509,12 @@ static void aggiorna_da(cJSON *r, bool ok, const char *motivo)
     cJSON *d = cJSON_GetObjectItemCaseSensitive(r, "dim");
     cJSON *s = cJSON_GetObjectItemCaseSensitive(r, "sha256");
     if (!cJSON_IsString(u) || !cJSON_IsNumber(d) || d->valuedouble < 1 || !cJSON_IsString(s)) {
-        messaggio("Aggiornamento: risposta del PC non valida"); vibra(250); return;
+        errore_msg("aggiorna", "Aggiornamento: risposta del PC non valida"); vibra(250); return;
     }
     messaggio("Scarico l'aggiornamento...");
     ponte_chiudi();   // lo scaricamento apre la sua connessione, e la memoria (AES, PSRAM) e' scarsa (LEZIONI_OROLOGIO.md)
     aggiorna_esito_t e = aggiorna_scarica(u->valuestring, (size_t)d->valuedouble, s->valuestring, avanzamento);
-    if (e != AGGIORNA_OK) { messaggio(aggiorna_esito_testo(e)); vibra(250); return; }
+    if (e != AGGIORNA_OK) { errore_msg("aggiorna", aggiorna_esito_testo(e)); vibra(250); return; }
     messaggio("Aggiornato e verificato: riavvio");
     vibra_due();
     vTaskDelay(pdMS_TO_TICKS(1500));
@@ -512,9 +534,9 @@ static void gestisci_risposta(const char *inviato, const char *testo)
         else if (strcmp(motivo, "pin_errato") == 0) {
             cJSON *rim = cJSON_GetObjectItemCaseSensitive(r, "rimasti");
             snprintf(riga, sizeof riga, "Gesto sbagliato: restano %d tentativi", cJSON_IsNumber(rim) ? rim->valueint : 0);
-            messaggio(riga); vibra(250);
-        } else if (strcmp(motivo, "scollegato") == 0) { messaggio("Tre gesti sbagliati: orologio scollegato, va riabbinato col cavo"); vibra(250); }
-        else { snprintf(riga, sizeof riga, "Il PC dice: %s", motivo); messaggio(riga); }
+            errore_msg("sblocca", riga); vibra(250);
+        } else if (strcmp(motivo, "scollegato") == 0) { errore_msg("sblocca", "Tre gesti sbagliati: orologio scollegato, va riabbinato col cavo"); vibra(250); }
+        else { snprintf(riga, sizeof riga, "Il PC dice: %s", motivo); errore_msg("sblocca", riga); }
     } else if (strstr(inviato, "\"aggiorna\"")) {
         aggiorna_da(r, ok, motivo);
     } else if (strstr(inviato, "\"blocca\"")) {
@@ -522,24 +544,45 @@ static void gestisci_risposta(const char *inviato, const char *testo)
     } else {
         if (ok) { messaggio("PC raggiungibile, orologio sbloccato"); vibra(60); }
         else if (strcmp(motivo, "bloccato") == 0) { sbloccato = false; messaggio("L'ora e' passata: disegna il gesto"); vibra(60); }
-        else { snprintf(riga, sizeof riga, "Il PC dice: %s", motivo); messaggio(riga); }
+        else { snprintf(riga, sizeof riga, "Il PC dice: %s", motivo); errore_msg("stato", riga); }
     }
     cJSON_Delete(r);
 }
+
+// Dove e' nato un errore del dialogo, per la telemetria: la parola dice a che richiesta appartiene.
+static const char *origine_di(const char *json)
+{
+    return strstr(json, "\"sblocca\"") ? "sblocca" : strstr(json, "\"aggiorna\"") ? "aggiorna" : strstr(json, "\"blocca\"") ? "blocca" : "stato";
+}
+
+// Telemetria (telemetria.c): quando il dialogo non ha niente in coda e la voce non lavora, spedisce al PC cio' che l'orologio ha da
+// dire. Se non parte (PC spento, rete) riprova dopo un po', sempre piu' di rado: non deve costare batteria ne' disturbare la voce.
+#define TELEMETRIA_PAUSA_MS       2000     // fra una spedizione riuscita e la prossima
+#define TELEMETRIA_RIPROVA_MS     30000    // dopo un insuccesso, poi si raddoppia fino a...
+#define TELEMETRIA_RIPROVA_MAX_MS 120000   // ...due minuti: abbastanza raro per la batteria, abbastanza presto quando il PC torna
 
 static void dialogo(void *arg)
 {
     (void)arg;
     static char risposta[1024];
     richiesta_t r;
+    uint32_t telemetria_dopo = 0, telemetria_attesa = TELEMETRIA_RIPROVA_MS;
     for (;;) {
-        xQueueReceive(richieste, &r, portMAX_DELAY);
+        if (xQueueReceive(richieste, &r, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            // Niente in coda: e' il momento della telemetria, se la voce non sta lavorando e la wifi c'e'.
+            if (!voce_occupata && rete_fase() == RETE_COLLEGATA && memoria_abbinato() && telemetria_da_mandare()
+                && (int32_t)(adesso_ms() - telemetria_dopo) >= 0) {
+                if (telemetria_manda()) { telemetria_attesa = TELEMETRIA_RIPROVA_MS; telemetria_dopo = adesso_ms() + TELEMETRIA_PAUSA_MS; }
+                else { telemetria_dopo = adesso_ms() + telemetria_attesa; telemetria_attesa = telemetria_attesa >= TELEMETRIA_RIPROVA_MAX_MS / 2 ? TELEMETRIA_RIPROVA_MAX_MS : telemetria_attesa * 2; }
+            }
+            continue;
+        }
         ponte_esito_t e = ponte_scambia(r.json, risposta, sizeof risposta);
         if (e == PONTE_OK) {
             aggiorna_conferma();   // il PC ha risposto: il programma nuovo funziona e resta
             gestisci_risposta(r.json, risposta);
         }
-        else { messaggio(ponte_esito_testo(e)); vibra(250); }
+        else { errore_msg(origine_di(r.json), ponte_esito_testo(e)); vibra(250); }
         memset(&r, 0, sizeof r);
         memset(risposta, 0, sizeof risposta);
     }
@@ -574,8 +617,6 @@ static bool leggi_boot(void)
     return boot_tenuto;
 }
 
-static uint32_t adesso_ms(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
-
 // Mentre registra: BOOT ancora giu'? Ogni secondo circa aggiorna i secondi sullo schermo (e lo tiene acceso).
 static uint32_t inizio_registrazione = 0, ultimo_secondo = 0;
 static bool continua_registrazione(void)
@@ -607,6 +648,7 @@ static void rifiuto_voce(const char *motivo)
 {
     char riga[96];
     vibra(250);
+    telemetria_errore("pc", motivo);   // il codice del PC (formato, incompleto, bloccato...), mai testo di chi parla
     // Bloccato: il pannello si chiude con lo sblocco (aggiorna_bloccato), la frase va sopra la griglia del gesto.
     if (strcmp(motivo, "bloccato") == 0) { sbloccato = false; messaggio("L'ora e' passata: disegna il gesto"); return; }
     if (strcmp(motivo, "incompleto") == 0) snprintf(riga, sizeof riga, "L'audio e' arrivato a meta': riprova");
@@ -625,10 +667,26 @@ static void rifiuto_voce(const char *motivo)
 static bool ascolto_fermato = false;
 static unsigned secondi_voce = 0;   // lunghezza della risposta letta, per la riga che dice che ha suonato
 // Tempi dell'ultimo giro (26/11/2026: "dall'orologio e' molto piu' lento che dal telefono" andava misurato, non indovinato):
-// durata dell'invio dell'audio, attesa fra la fine dell'invio e la risposta, scaricamento della voce. Stanno sullo schermo,
-// sotto la risposta, in secondi e decimi.
-static uint32_t ms_invio = 0, ms_attesa = 0, ms_scarico = 0;
+// durata dell'invio dell'audio, attesa fra la fine dell'invio e la risposta, scaricamento della voce. Stanno sullo schermo, in
+// cima alla risposta, in secondi e decimi, e vanno al PC in millisecondi (telemetria.c) insieme alla durata dell'ascolto e a
+// quanto e' costata la rete nel giro.
+static uint32_t ms_invio = 0, ms_attesa = 0, ms_scarico = 0, ms_riproduzione = 0;
+static rete_statistiche_t rete_inizio_giro;   // la rete al momento di premere BOOT: la differenza e' il costo del giro
 #define DECIMI(ms) (unsigned)((ms) / 1000), (unsigned)(((ms) % 1000) / 100)
+
+// I tempi del giro finito al PC. `esito`: TELEMETRIA_* (come e' finita la voce).
+static void tempi_telemetria(int esito)
+{
+    rete_statistiche_t ora;
+    rete_statistiche(&ora);
+    const telemetria_tempi_t t = {
+        .invio = ms_invio, .attesa = ms_attesa, .scarico = ms_scarico, .riproduzione = ms_riproduzione, .esito = esito,
+        .richieste = ora.richieste - rete_inizio_giro.richieste,
+        .connessioni = ora.collegamenti - rete_inizio_giro.collegamenti,
+        .apertura = ora.ms_apertura - rete_inizio_giro.ms_apertura,
+    };
+    telemetria_tempi(&t);
+}
 
 // La riga dei tempi, "invio 3,2 s, risposta dopo 9,8 s, scarico 4,1 s" (senza lo scarico se la voce non e' stata scaricata).
 static void riga_tempi(char *dst, size_t cap, bool con_scarico)
@@ -711,7 +769,10 @@ static const char *ascolta_risposta(void)
     free(buf);   // prima di suonare: 256 KB di PSRAM tornano liberi
     if (!esito && !ascolto_fermato && pcm) {
         secondi_voce = (unsigned)(campioni / VOCE_HZ);
-        if (!voce_riproduci(pcm, campioni, continua_ascolto)) esito = "altoparlante non disponibile";
+        const uint32_t t_ascolto = adesso_ms();
+        const bool suonato = voce_riproduci(pcm, campioni, continua_ascolto);
+        ms_riproduzione = adesso_ms() - t_ascolto;
+        if (!suonato) esito = "altoparlante non disponibile";
         else if (tagliata && !ascolto_fermato) esito = "voce tagliata: il resto e' nell'app";
     }
     free(pcm);
@@ -734,18 +795,21 @@ static void ascolta(void)
     mostra_voce(schermo_voce, false);
     // In cima al pannello i tempi del giro (26/11/2026): quanto e' durato l'invio, l'attesa della risposta e lo scaricamento della voce.
     mostra_tempi(true);
+    // E al PC: tempi del giro e, se la voce non e' andata, l'errore com'e' scritto qui sopra.
+    if (esito) telemetria_errore("audio", esito);
+    tempi_telemetria(esito ? TELEMETRIA_VOCE_ERRORE : ascolto_fermato ? TELEMETRIA_VOCE_INTERROTTA : TELEMETRIA_VOCE_SUONATA);
 }
 
 // Una richiesta di stato. Torna true se bisogna continuare a chiedere.
 static bool chiedi_stato_voce(char *risposta)
 {
-    if (adesso_ms() - voce_dal > ATTESA_VOCE_MAX_MS) { stato_voce("Non aspetto piu': la risposta sara' nell'app", false); return false; }
+    if (adesso_ms() - voce_dal > ATTESA_VOCE_MAX_MS) { errore_voce("stato", "Non aspetto piu': la risposta sara' nell'app"); return false; }
     char json[96];
     snprintf(json, sizeof json, "{\"t\":\"voce_stato\",\"id\":\"%.36s\"}", id_voce);
     ponte_esito_t e = ponte_scambia(json, risposta, RISPOSTA_VOCE_CAP);
     if (e != PONTE_OK) {
         if (++errori_voce < ERRORI_STATO_MAX) return true;
-        stato_voce(ponte_esito_testo(e), true);
+        errore_voce("stato", ponte_esito_testo(e));
         vibra(250);
         return false;
     }
@@ -800,6 +864,7 @@ static bool chiedi_stato_voce(char *risposta)
     if (fine) {
         stato_voce("", false);   // la risposta e' arrivata: la fascia non ripete piu' "al lavoro..."
         mostra_tempi(false);     // senza lo scarico: si aggiunge quando la voce e' scaricata (ascolta)
+        if (!parla) tempi_telemetria(con_risposta ? TELEMETRIA_SENZA_VOCE : TELEMETRIA_SENZA_RISPOSTA);   // con la voce lo fa ascolta()
         if (con_risposta) vibra_due(); else vibra(60);
     }
     cJSON_Delete(r);
@@ -817,7 +882,9 @@ static bool registra_e_manda(char *risposta)
         pcm = heap_caps_malloc(max * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (pcm) break;
     }
-    if (!pcm) { stato_voce("Memoria insufficiente per registrare", true); vibra(250); return false; }
+    if (!pcm) { errore_voce("voce", "Memoria insufficiente per registrare"); vibra(250); return false; }
+    rete_statistiche(&rete_inizio_giro);   // da qui il giro: la rete che costa si legge per differenza (tempi_telemetria)
+    ms_riproduzione = 0;
     ponte_chiudi();   // i microfoni chiedono memoria interna (I2S, circa 17 KB): la connessione sicura non resta aperta durante la registrazione
     vibra(40);
     inizio_registrazione = adesso_ms();
@@ -827,7 +894,7 @@ static bool registra_e_manda(char *risposta)
         free(pcm);
         char riga[200];   // 27 di testo fisso + voce_errore (al massimo 159)
         snprintf(riga, sizeof riga, "Microfoni non disponibili:\n%s", voce_errore()[0] ? voce_errore() : "motivo sconosciuto");
-        stato_voce(riga, true); vibra(250); return false;
+        errore_voce("mic", riga); vibra(250); return false;
     }
     if ((uint32_t)n * 1000u / VOCE_HZ < VOCE_MIN_MS) { free(pcm); stato_voce("Troppo breve: tieni premuto BOOT mentre parli", true); return false; }
     char riga[80];
@@ -839,7 +906,7 @@ static bool registra_e_manda(char *risposta)
     ms_attesa = 0;
     ms_scarico = 0;
     free(pcm);
-    if (e != PONTE_OK) { stato_voce(ponte_esito_testo(e), true); vibra(250); return false; }
+    if (e != PONTE_OK) { errore_voce("invio", ponte_esito_testo(e)); vibra(250); return false; }
     aggiorna_conferma();
     cJSON *r = cJSON_Parse(risposta);
     bool ok = r && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"));
@@ -895,6 +962,7 @@ static void esegui_prova_suono(void)
     mostra_voce("Prova suono: tra un attimo senti un tono (1000 Hz, 1 secondo)...", true);
     bool ok = voce_prova_suono(esito_prova, sizeof esito_prova);
     mostra_voce(esito_prova, true);
+    if (!ok) telemetria_errore("prova", esito_prova);
     vibra(ok ? 60 : 250);
 }
 
@@ -903,7 +971,7 @@ static void parla(void *arg)
     (void)arg;
     char *risposta = (char *)heap_caps_malloc(RISPOSTA_VOCE_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     schermo_voce = (char *)heap_caps_malloc(RISPOSTA_VOCE_CAP + 64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!risposta || !schermo_voce) { ESP_LOGE(TAG, "voce: memoria"); messaggio("Voce non disponibile: PSRAM piena"); vTaskDelete(NULL); return; }
+    if (!risposta || !schermo_voce) { ESP_LOGE(TAG, "voce: memoria"); errore_msg("voce", "Voce non disponibile: PSRAM piena"); vTaskDelete(NULL); return; }
     bool prima = false, segui = false;
     uint32_t prossima = 0;
     for (;;) {
@@ -911,9 +979,11 @@ static void parla(void *arg)
         bool ora = leggi_boot();
         bool premuto = ora && !prima;
         prima = ora;
+        voce_occupata = ora || segui;   // BOOT giu' o un messaggio da seguire: la telemetria aspetta (durante registra_e_manda resta vero)
         // Prova suono (tasto sullo schermo o avvio): qui, nel compito che registra e ascolta, e mai con BOOT premuto per parlare.
         if (!ora && (prova_suono_richiesta || prova_avvio_pronta())) {
             prova_suono_richiesta = false;
+            voce_occupata = true;
             esegui_prova_suono();
             continue;
         }
@@ -931,7 +1001,7 @@ static void parla(void *arg)
         if (!memoria_abbinato()) { messaggio("Voce: orologio non abbinato al PC"); vibra(250); continue; }
         if (!sbloccato) { messaggio("Disegna il gesto, poi tieni premuto BOOT per parlare"); continue; }
         // Un messaggio nuovo smette di seguire il precedente: la sua risposta resta nell'app.
-        segui = registra_e_manda(risposta);
+        segui = registra_e_manda(risposta);   // voce_occupata resta vero: e' stato scritto alla pressione di BOOT
         prima = leggi_boot();
         prossima = adesso_ms() + riprova_voce;
         memset(risposta, 0, RISPOSTA_VOCE_CAP);
@@ -992,6 +1062,7 @@ void app_main(void)
     xTaskCreate(motore, "motore", 2048, NULL, 5, &compito_motore);
 
     memoria_avvia();
+    telemetria_avvia();   // la coda degli eventi per il PC, nella PSRAM; prima dei compiti che la riempiono
     richieste = xQueueCreate(4, sizeof(richiesta_t));
 
     // Schermo PRIMA del wifi: la sua memoria per i trasferimenti si prende quando c'e'. Il pacchetto della
@@ -1037,7 +1108,7 @@ void app_main(void)
         ESP_LOGE(TAG, "voce: compito non creato");
         static char avviso[96];
         snprintf(avviso, sizeof avviso, "Voce non disponibile: memoria interna piena\n(libera %u, blocco %u)", (unsigned)interna, (unsigned)blocco);
-        messaggio(avviso);
+        errore_msg("avvio", avviso);
     }
 
     vibra(200); // segno di vita all'accensione

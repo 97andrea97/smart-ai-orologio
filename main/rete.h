@@ -3,10 +3,19 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum { RETE_SPENTA, RETE_NESSUNA_SALVATA, RETE_IN_COLLEGAMENTO, RETE_COLLEGATA } rete_fase_t;
 
 void rete_avvia(void);
+
+// Misure della rete dall'avvio (26/11/2026), per la telemetria verso il PC (telemetria.c): richieste fatte al ponte, connessioni
+// sicure aperte da zero con il tempo che e' costata la loro apertura (DNS, TCP, stretta di mano TLS), e quando e' arrivato
+// il primo indirizzo dalla wifi (ms dall'avvio, 0 = mai). Chi misura un giro ne fa la differenza fra due letture.
+typedef struct { uint32_t richieste, collegamenti, ms_apertura, ms_wifi; } rete_statistiche_t;
+void rete_statistiche(rete_statistiche_t *s);
+// Forza del segnale della wifi a cui e' collegato, in dBm (negativo), 0 se non e' collegato. Mai il nome della rete.
+int rete_segnale(void);
 // Rilegge le reti salvate e ricomincia a collegarsi (dopo che la pagina ne ha aggiunta una).
 void rete_ricarica(void);
 rete_fase_t rete_fase(void);

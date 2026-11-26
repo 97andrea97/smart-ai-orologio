@@ -42,6 +42,8 @@ static rete_t reti[MAX_RETI];
 static int n_reti = 0, rete_corrente = 0;
 static volatile rete_fase_t fase = RETE_SPENTA;
 static esp_netif_t *netif_sta = NULL;
+static uint32_t ora_ms(void);                 // definita sotto, con le misure
+static rete_statistiche_t statistiche;        // dall'avvio (rete.h); scrive solo chi ha preso `scambio`, tranne ms_wifi (evento)
 
 // Il motivo vero dell'ultimo "errore di rete" (26/11/2026): su una rete diversa dall'hotspot l'orologio diceva solo
 // "Errore di rete" e non si capiva dove si fermava. Tre righe corte per lo schermo: fase (DNS, connessione, tempo
@@ -138,6 +140,7 @@ static void evento(void *arg, esp_event_base_t base, int32_t id, void *dati)
         prova_rete(rete_corrente);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         dns_di_ripiego();   // prima di dichiararsi collegata: il primo scambio ha gia' il secondo DNS
+        if (statistiche.ms_wifi == 0) statistiche.ms_wifi = ora_ms();
         fase = RETE_COLLEGATA;
         ESP_LOGI(TAG, "collegato a %s", reti[rete_corrente].ssid);
         xEventGroupSetBits(eventi, BIT_COLLEGATA);
@@ -180,6 +183,14 @@ void rete_ricarica(void)
 
 rete_fase_t rete_fase(void) { return fase; }
 const char *rete_nome(void) { return n_reti ? reti[rete_corrente].ssid : ""; }
+void rete_statistiche(rete_statistiche_t *s) { *s = statistiche; }
+
+int rete_segnale(void)
+{
+    wifi_ap_record_t ap;
+    if (fase != RETE_COLLEGATA || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return 0;
+    return ap.rssi;   // solo la forza: il nome della rete (ap.ssid) non esce da qui
+}
 
 bool rete_attendi(int ms)
 {
@@ -284,6 +295,7 @@ static int chiama(const char *url, const char *gettone, esp_http_client_method_t
     *letti = 0;
     int stato = -1;
     misura.richieste++;
+    statistiche.richieste++;
     for (int tentativo = 0; tentativo < 2; tentativo++) {
         bool riuso = s_cl != NULL;
         if (riuso && (uint32_t)(ora_ms() - s_cl_ultimo_ms) > RIUSO_MAX_FERMA_MS) { chiudi_connessione(); riuso = false; }
@@ -297,6 +309,7 @@ static int chiama(const char *url, const char *gettone, esp_http_client_method_t
             s_cl = esp_http_client_init(&c);
             if (!s_cl) { segna_motivo("memoria", "client HTTP non creato"); return -1; }
             misura.collegamenti++;
+            statistiche.collegamenti++;
         } else {
             esp_http_client_set_url(s_cl, url);
             esp_http_client_set_method(s_cl, metodo);
@@ -306,7 +319,9 @@ static int chiama(const char *url, const char *gettone, esp_http_client_method_t
         stato = -1;
         *letti = 0;
         // Ogni strada che finisce senza stato HTTP lascia il motivo (segna_trasporto): fase e codici, non solo "errore".
+        const uint32_t t_apertura = ora_ms();
         esp_err_t aperta = esp_http_client_open(s_cl, corpo ? lung : 0);
+        if (!riuso) statistiche.ms_apertura += ora_ms() - t_apertura;   // connessione nuova: DNS, TCP e stretta di mano TLS stanno qui
         if (aperta == ESP_OK) {
             if (!corpo || esp_http_client_write(s_cl, (const char *)corpo, lung) == lung) {
                 esp_http_client_fetch_headers(s_cl);
