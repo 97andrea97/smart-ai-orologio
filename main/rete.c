@@ -90,7 +90,7 @@ static void segna_trasporto(esp_http_client_handle_t cl, const char *fase_rete, 
 
 // DNS di ripiego (26/11/2026): con l'hotspot del telefono l'orologio funzionava, sulla wifi di casa no; il DNS lo dava solo
 // il modem. Il principale resta quello del DHCP; se la rete non ne ha dato un secondo, il secondo e' 1.1.1.1 (Cloudflare,
-// lo stesso fornitore del ponte: SCELTA DA CONFERMARE con Andrea). lwIP passa al secondo solo quando il primo non risponde.
+// lo stesso fornitore del ponte: scelta da confermare). lwIP passa al secondo solo quando il primo non risponde.
 // API di esp_netif v5.5.5 (esp_netif.h): il secondo (BACKUP) puo' darlo anche il DHCP, quindi si guarda prima.
 static void dns_di_ripiego(void)
 {
