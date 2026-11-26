@@ -47,3 +47,11 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # durante lo scaricamento: la cifratura AES in hardware chiede memoria interna per il DMA e non la trova. La fa il processore:
 # un po' piu' lento, nessuna memoria interna in piu'. Opzione documentata di ESP-IDF (mbedTLS > Enable hardware AES acceleration).
 CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# Microfoni (26/11/2026): alla prima pressione di BOOT "avvio I2S: ESP_ERR_NO_MEM (DMA libera 4891)". L'I2S chiede circa 17 KB
+# di memoria interna per il DMA (6 buffer da 240 frame per l'uscita stereo e per l'ingresso a 4 posti, valori di
+# I2S_CHANNEL_DEFAULT_CONFIG in ESP-IDF v5.5.5) e ne restano 5. Sull'ESP32-S3 la memoria interna e' una sola per codice
+# (IRAM) e dati: le funzioni del wifi tenute li' per velocita' si lasciano nella flash. Testo del Kconfig di esp_wifi v5.5.5:
+# piu' di 10 KB (IRAM_OPT) e piu' di 17 KB (RX_IRAM_OPT) di IRAM risparmiati, wifi un po' piu' lento. Lo schermo non cambia.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
