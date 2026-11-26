@@ -30,3 +30,9 @@ ponte_esito_t ponte_scambia(const char *json, char *risposta, size_t cap);
 // risponde lo stesso e il ponte butta la risposta dopo dieci minuti); `risposta` resta com'era.
 ponte_esito_t ponte_manda(const char *json, size_t lung, bool attendi, char *risposta, size_t cap);
 const char *ponte_esito_testo(ponte_esito_t e);
+
+// La connessione sicura al ponte resta aperta fra una richiesta e l'altra (26/11/2026, rete.c): ponte_chiudi la chiude
+// (prima di registrare, di suonare, di aggiornare: servono memoria e tempo; aspetta fino a 2 s uno scambio in corso),
+// ponte_pulisci la chiude solo se ferma da troppo e senza aspettare (si chiama a ogni giro dal compito che la usa).
+void ponte_chiudi(void);
+void ponte_pulisci(void);

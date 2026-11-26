@@ -24,8 +24,17 @@ static const char *TAG = "rete";
 #define DIR_OROLOGIO 0x4F
 #define DIR_PC       0x50
 #define MAX_BUSTA    4096
+// Quanto aspetta la risposta del PC a una richiesta, in tempo vero (dal 26/11/2026 conta anche la durata delle richieste:
+// prima contava solo le pause). Assoluto: e' il tempo che il PC ha per rispondere a una singola busta.
 #define ATTESA_RISPOSTA_MS 25000
+// Pausa fra due ritiri della risposta. Con la connessione riusata un ritiro costa una frazione di secondo, e il PC risponde
+// in poche decine di millisecondi: con i 500 ms fissi di prima la risposta arrivava quasi sempre al secondo ritiro, mezzo
+// secondo dopo. Si ritira presto (primo secondo), poi meno spesso: una risposta che tarda e' un lavoro lungo del PC.
+#define PASSO_PRIMO_MS     100
+#define PASSO_MEDIO_MS     250
 #define PASSO_RISPOSTA_MS  500
+#define FINE_PRIMO_MS      1000
+#define FINE_MEDIO_MS      5000
 
 static EventGroupHandle_t eventi;
 static SemaphoreHandle_t scambio;            // un messaggio per volta, come il PC
@@ -223,41 +232,109 @@ static bool apri(const uint8_t chiave[32], const uint8_t *busta, int lung, char 
 
 // ---- HTTP verso il ponte -------------------------------------------------------------------------
 
+// Connessione sicura riusata (26/11/2026). Prima ogni richiesta apriva e chiudeva una connessione nuova: una stretta di
+// mano TLS (DNS, TCP, certificati, scambio delle chiavi, fatti dal processore con la memoria nella PSRAM) per l'invio e
+// un'altra per ogni ritiro, quindi almeno due a ogni scambio e due per ogni pezzo di voce. Ora la connessione resta
+// aperta (HTTP/1.1 la tiene) e le richieste dopo la prima viaggiano su quella. Letto sul sorgente di esp_http_client
+// v5.5.5: esp_http_client_open() riprepara ogni volta la richiesta e non riapre una connessione gia' aperta;
+// esp_http_client_set_url() con lo stesso indirizzo non la chiude. Se la connessione riusata e' caduta (il ponte l'ha
+// chiusa, il wifi e' cambiato) la richiesta si ripete UNA volta su una nuova, cioe' come prima di questo cambio.
+// Solo con `scambio` preso (ponte_manda, ponte_chiudi, ponte_pulisci).
+// RIUSO_MAX_FERMA_MS: oltre questo tempo senza richieste la connessione si chiude invece di tentare di riusarla. Assoluto e
+// cautela nostra: il tempo per cui il ponte la tiene aperta non e' scritto in nessuna documentazione letta qui, e fra due
+// richieste di uno stesso scambio passano al massimo 6 s (RIPROVA_LUNGA_MS del PC).
+#define RIUSO_MAX_FERMA_MS 15000
+static esp_http_client_handle_t s_cl = NULL;
+static uint32_t s_cl_ultimo_ms = 0;
+// Misure dell'ultima ponte_manda, solo per il registro seriale ("ponte: ..."): durata in tutto e fino alla fine dell'invio,
+// richieste HTTP fatte e connessioni sicure aperte da zero (con la connessione riusata 0 o 1; prima una per richiesta).
+static struct { uint32_t ms, ms_invio, richieste, collegamenti; } misura;
+
+static uint32_t ora_ms(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
+
+static void chiudi_connessione(void)
+{
+    if (!s_cl) return;
+    esp_http_client_close(s_cl);
+    esp_http_client_cleanup(s_cl);
+    s_cl = NULL;
+}
+
+void ponte_chiudi(void)
+{
+    if (!scambio || xSemaphoreTake(scambio, pdMS_TO_TICKS(2000)) != pdTRUE) return;   // uno scambio in corso la sta usando
+    chiudi_connessione();
+    xSemaphoreGive(scambio);
+}
+
+void ponte_pulisci(void)
+{
+    if (!s_cl || (uint32_t)(ora_ms() - s_cl_ultimo_ms) <= RIUSO_MAX_FERMA_MS) return;
+    if (!scambio || xSemaphoreTake(scambio, 0) != pdTRUE) return;
+    if (s_cl && (uint32_t)(ora_ms() - s_cl_ultimo_ms) > RIUSO_MAX_FERMA_MS) chiudi_connessione();
+    xSemaphoreGive(scambio);
+}
+
 // Una richiesta: torna il codice HTTP (o -1) e mette il corpo della risposta in `fuori`.
 static int chiama(const char *url, const char *gettone, esp_http_client_method_t metodo,
                   const uint8_t *corpo, int lung, uint8_t *fuori, int cap, int *letti)
 {
     char autorizzazione[80];
     snprintf(autorizzazione, sizeof autorizzazione, "Bearer %s", gettone);
-    esp_http_client_config_t c = {
-        .url = url,
-        .method = metodo,
-        .timeout_ms = 15000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };
     *letti = 0;
-    esp_http_client_handle_t cl = esp_http_client_init(&c);
-    if (!cl) { segna_motivo("memoria", "client HTTP non creato"); return -1; }
-    esp_http_client_set_header(cl, "Authorization", autorizzazione);
-    if (corpo) esp_http_client_set_header(cl, "Content-Type", "application/octet-stream");
     int stato = -1;
-    // Ogni strada che finisce senza stato HTTP lascia il motivo (segna_trasporto): fase e codici, non solo "errore".
-    esp_err_t aperta = esp_http_client_open(cl, corpo ? lung : 0);
-    if (aperta == ESP_OK) {
-        if (!corpo || esp_http_client_write(cl, (const char *)corpo, lung) == lung) {
-            esp_http_client_fetch_headers(cl);
-            stato = esp_http_client_get_status_code(cl);
-            if (stato <= 0) segna_trasporto(cl, "risposta", ESP_OK);
-            int n = esp_http_client_read_response(cl, (char *)fuori, cap);
-            *letti = n > 0 ? n : 0;
+    misura.richieste++;
+    for (int tentativo = 0; tentativo < 2; tentativo++) {
+        bool riuso = s_cl != NULL;
+        if (riuso && (uint32_t)(ora_ms() - s_cl_ultimo_ms) > RIUSO_MAX_FERMA_MS) { chiudi_connessione(); riuso = false; }
+        if (!s_cl) {
+            esp_http_client_config_t c = {
+                .url = url,
+                .method = metodo,
+                .timeout_ms = 15000,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+            };
+            s_cl = esp_http_client_init(&c);
+            if (!s_cl) { segna_motivo("memoria", "client HTTP non creato"); return -1; }
+            misura.collegamenti++;
         } else {
-            segna_trasporto(cl, "invio", ESP_OK);
+            esp_http_client_set_url(s_cl, url);
+            esp_http_client_set_method(s_cl, metodo);
         }
-    } else {
-        segna_trasporto(cl, NULL, aperta);
+        esp_http_client_set_header(s_cl, "Authorization", autorizzazione);
+        esp_http_client_set_header(s_cl, "Content-Type", corpo ? "application/octet-stream" : NULL);   // NULL = tolta, come fa il client stesso
+        stato = -1;
+        *letti = 0;
+        // Ogni strada che finisce senza stato HTTP lascia il motivo (segna_trasporto): fase e codici, non solo "errore".
+        esp_err_t aperta = esp_http_client_open(s_cl, corpo ? lung : 0);
+        if (aperta == ESP_OK) {
+            if (!corpo || esp_http_client_write(s_cl, (const char *)corpo, lung) == lung) {
+                esp_http_client_fetch_headers(s_cl);
+                stato = esp_http_client_get_status_code(s_cl);
+                if (stato <= 0) {
+                    segna_trasporto(s_cl, "risposta", ESP_OK);   // niente lettura del corpo: su una connessione morta costerebbe un'altra attesa
+                } else {
+                    int n = esp_http_client_read_response(s_cl, (char *)fuori, cap);
+                    *letti = n > 0 ? n : 0;
+                }
+            } else {
+                segna_trasporto(s_cl, "invio", ESP_OK);
+            }
+        } else {
+            segna_trasporto(s_cl, NULL, aperta);
+        }
+        if (stato > 0) {
+            s_cl_ultimo_ms = ora_ms();
+            // Si riusa solo se il ponte la tiene aperta e la risposta e' stata letta tutta: cio' che avanzasse in
+            // coda sporcherebbe la risposta della richiesta dopo.
+            if (!esp_http_client_is_persistent_connection(s_cl) || !esp_http_client_is_complete_data_received(s_cl)) chiudi_connessione();
+            return stato;
+        }
+        chiudi_connessione();
+        if (!riuso) return stato;        // era gia' una connessione nuova: l'errore e' vero
+        ESP_LOGW(TAG, "connessione riusata caduta: ne apro una nuova");
+        motivo[0] = 0;                   // il motivo di questo tentativo non vale piu': ne scrivera' uno il prossimo
     }
-    esp_http_client_close(cl);
-    esp_http_client_cleanup(cl);
     return stato;
 }
 
@@ -297,6 +374,8 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
 
     xSemaphoreTake(scambio, portMAX_DELAY);
     motivo[0] = 0;
+    memset(&misura, 0, sizeof misura);
+    const uint32_t inizio = ora_ms();
     ponte_esito_t esito = PONTE_ERRORE;
     char riga[48];
     // La busta e' grande quanto il messaggio; quella di risposta quanto `cap` (piu' nonce e sigillo), mai meno di MAX_BUSTA.
@@ -326,6 +405,7 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
         if (stato > 0) { snprintf(riga, sizeof riga, "invio, stato %d", stato); segna_motivo("HTTP", riga); }
         goto fine;
     }
+    misura.ms_invio = ora_ms() - inizio;
     dati[letti] = 0;
     // {"id":"<uuid>"}: basta trovare il valore fra virgolette dopo "id"
     char *p = strstr((char *)dati, "\"id\"");
@@ -335,7 +415,8 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
 
     snprintf(url, sizeof url, "%s/o/risposta?id=%s", base, id);
     esito = PONTE_NESSUNA_RISPOSTA;
-    for (int t = 0; t < ATTESA_RISPOSTA_MS; t += PASSO_RISPOSTA_MS) {
+    const uint32_t inizio_attesa = ora_ms();
+    for (;;) {
         stato = chiama(url, gettone, HTTP_METHOD_GET, NULL, 0, dati, (int)cap_dati, &letti);
         if (stato == 200) {
             esito = apri(chiave, dati, letti, risposta, cap) ? PONTE_OK : PONTE_ERRORE;
@@ -347,9 +428,14 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
             esito = PONTE_ERRORE;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(PASSO_RISPOSTA_MS));
+        const uint32_t attesa = ora_ms() - inizio_attesa;
+        if (attesa >= ATTESA_RISPOSTA_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(attesa < FINE_PRIMO_MS ? PASSO_PRIMO_MS : attesa < FINE_MEDIO_MS ? PASSO_MEDIO_MS : PASSO_RISPOSTA_MS));
     }
 fine:
+    misura.ms = ora_ms() - inizio;
+    ESP_LOGI(TAG, "ponte: %u ms in tutto (invio %u ms), %u richieste, %u connessioni nuove, esito %d", (unsigned)misura.ms,
+             (unsigned)misura.ms_invio, (unsigned)misura.richieste, (unsigned)misura.collegamenti, (int)esito);
     free(busta);
     free(dati);
     memset(chiave, 0, sizeof chiave);

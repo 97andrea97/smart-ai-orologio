@@ -453,6 +453,7 @@ static void aggiorna_da(cJSON *r, bool ok, const char *motivo)
         messaggio("Aggiornamento: risposta del PC non valida"); vibra(250); return;
     }
     messaggio("Scarico l'aggiornamento...");
+    ponte_chiudi();   // lo scaricamento apre la sua connessione, e la memoria (AES, PSRAM) e' scarsa (LEZIONI_OROLOGIO.md)
     aggiorna_esito_t e = aggiorna_scarica(u->valuestring, (size_t)d->valuedouble, s->valuestring, avanzamento);
     if (e != AGGIORNA_OK) { messaggio(aggiorna_esito_testo(e)); vibra(250); return; }
     messaggio("Aggiornato e verificato: riavvio");
@@ -586,6 +587,18 @@ static void rifiuto_voce(const char *motivo)
 // ferma_ascolto e' dichiarato accanto a tocco_chiudi_voce, che lo accende.
 static bool ascolto_fermato = false;
 static unsigned secondi_voce = 0;   // lunghezza della risposta letta, per la riga che dice che ha suonato
+// Tempi dell'ultimo giro (26/11/2026: "dall'orologio e' molto piu' lento che dal telefono" andava misurato, non indovinato):
+// durata dell'invio dell'audio, attesa fra la fine dell'invio e la risposta, scaricamento della voce. Stanno sullo schermo,
+// sotto la risposta, in secondi e decimi.
+static uint32_t ms_invio = 0, ms_attesa = 0, ms_scarico = 0;
+#define DECIMI(ms) (unsigned)((ms) / 1000), (unsigned)(((ms) % 1000) / 100)
+
+// La riga dei tempi, "invio 3,2 s, risposta dopo 9,8 s, scarico 4,1 s" (senza lo scarico se la voce non e' stata scaricata).
+static void riga_tempi(char *dst, size_t cap, bool con_scarico)
+{
+    int n = snprintf(dst, cap, "invio %u,%u s, risposta dopo %u,%u s", DECIMI(ms_invio), DECIMI(ms_attesa));
+    if (con_scarico && n > 0 && (size_t)n < cap) snprintf(dst + n, cap - (size_t)n, ", scarico %u,%u s", DECIMI(ms_scarico));
+}
 
 static bool continua_ascolto(void)
 {
@@ -603,6 +616,7 @@ static const char *ascolta_risposta(void)
     bool tagliata = false;
     const char *esito = NULL;
     ascolto_fermato = false;
+    const uint32_t t_scarico = adesso_ms();
     for (size_t i = 0; i < pezzi && !esito; i++) {
         if (ferma_ascolto || gpio_get_level(TASTO_BOOT) == 0) { ascolto_fermato = true; break; }
         char json[96];
@@ -643,6 +657,8 @@ static const char *ascolta_risposta(void)
         }
         cJSON_Delete(r);
     }
+    ms_scarico = adesso_ms() - t_scarico;
+    ponte_chiudi();   // finito col ponte: la connessione sicura non serve mentre suona, e cade da sola se si aspetta
     free(buf);   // prima di suonare: 256 KB di PSRAM tornano liberi
     if (!esito && !ascolto_fermato && pcm) {
         secondi_voce = (unsigned)(campioni / VOCE_HZ);
@@ -666,6 +682,12 @@ static void ascolta(void)
     if (esito) snprintf(schermo_voce + base, cap - base, "\n\n(%.80s)", esito);
     else if (ascolto_fermato) snprintf(schermo_voce + base, cap - base, "\n\n(voce interrotta)");
     else snprintf(schermo_voce + base, cap - base, "\n\n(voce suonata, %u s)", secondi_voce);
+    // Sotto, i tempi del giro (26/11/2026): quanto e' durato l'invio, l'attesa della risposta e lo scaricamento della voce.
+    const size_t dopo = strlen(schermo_voce);
+    if (dopo + 2 < cap) {
+        schermo_voce[dopo] = '\n';
+        riga_tempi(schermo_voce + dopo + 1, cap - dopo - 1, true);
+    }
     mostra_voce(schermo_voce, false);
 }
 
@@ -710,12 +732,18 @@ static bool chiedi_stato_voce(char *risposta)
     // "l'altoparlante e' muto").
     cJSON *parla_pc = cJSON_GetObjectItemCaseSensitive(r, "parla");
     bool parla = fine && con_risposta && cJSON_IsTrue(parla_pc);
+    if (fine && voce_dal) ms_attesa = adesso_ms() - voce_dal;   // da quando l'invio e' finito a quando l'esito arriva
     if (fine && con_risposta && !parla) {
         const size_t cap = RISPOSTA_VOCE_CAP + 64, base = strlen(schermo_voce);
         const char *perche = !parla_pc ? "il PC non dice parla: riavvia il servizio"
                            : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "audio")) ? "Silenzioso acceso nelle Impostazioni"
                            : "la voce non e' pronta sul PC";
         snprintf(schermo_voce + base, cap - base, "\n\n(senza voce: %s)", perche);
+        const size_t dopo = strlen(schermo_voce);
+        if (dopo + 2 < cap) {
+            schermo_voce[dopo] = '\n';
+            riga_tempi(schermo_voce + dopo + 1, cap - dopo - 1, false);
+        }
     }
     mostra_voce(schermo_voce, fine);
     if (fine) { if (con_risposta) vibra_due(); else vibra(60); }
@@ -736,6 +764,7 @@ static bool registra_e_manda(char *risposta)
         if (pcm) break;
     }
     if (!pcm) { mostra_voce("Memoria insufficiente per registrare", true); vibra(250); return false; }
+    ponte_chiudi();   // i microfoni chiedono memoria interna (I2S, circa 17 KB): la connessione sicura non resta aperta durante la registrazione
     vibra(40);
     inizio_registrazione = adesso_ms();
     ultimo_secondo = UINT32_MAX;
@@ -750,7 +779,11 @@ static bool registra_e_manda(char *risposta)
     char riga[80];
     snprintf(riga, sizeof riga, "Invio %ld s di audio...%s", n / VOCE_HZ, (size_t)n >= max ? "\n(durata massima raggiunta)" : "");
     mostra_voce(riga, true);
+    const uint32_t t_invio = adesso_ms();
     ponte_esito_t e = voce_spedisci(pcm, (size_t)n, risposta, RISPOSTA_VOCE_CAP);
+    ms_invio = adesso_ms() - t_invio;
+    ms_attesa = 0;
+    ms_scarico = 0;
     free(pcm);
     if (e != PONTE_OK) { mostra_voce(ponte_esito_testo(e), true); vibra(250); return false; }
     aggiorna_conferma();
@@ -768,16 +801,18 @@ static bool registra_e_manda(char *risposta)
     cJSON_Delete(r);
     voce_dal = adesso_ms();
     errori_voce = 0;
-    mostra_voce("Inviato. Trascrivo...", true);
+    char inviato[48];
+    snprintf(inviato, sizeof inviato, "Inviato in %u,%u s. Trascrivo...", DECIMI(ms_invio));
+    mostra_voce(inviato, true);
     vibra(60);
     return true;
 }
 
 // ---- prova dell'altoparlante (26/11/2026) ------------------------------------------------------------------
-// Un tono generato qui (voce_prova_suono), senza PC, wifi, ponte ne' sblocco: suona una volta all'avvio e ogni volta che si tocca
-// "Prova suono". L'esito del pilota resta nel pannello fino a Chiudi. Scelta nostra e temporanea: finche' non si sa che
-// l'altoparlante funziona; poi PROVA_SUONO_ALL_AVVIO si mette a 0 (a ogni riavvio, anche dopo un aggiornamento, il tono si sente).
-#define PROVA_SUONO_ALL_AVVIO     1
+// Un tono generato qui (voce_prova_suono), senza PC, wifi, ponte ne' sblocco: suona ogni volta che si tocca "Prova suono".
+// L'esito del pilota resta nel pannello fino a Chiudi. All'avvio non suona piu' dal 26/11/2026: alle 15:37
+// (tono) e alle 15:51 (risposta letta) e' stato confermato che l'altoparlante funziona; per riavere il tono a ogni avvio, PROVA_SUONO_ALL_AVVIO a 1.
+#define PROVA_SUONO_ALL_AVVIO     0
 // All'avvio il tono aspetta il wifi, e se il programma e' appena arrivato (in prova) anche la prima risposta del PC: aprire l'I2S
 // prende circa 17 KB di memoria interna (vedi LEZIONI, microfoni) e non deve contendersi la memoria con la prima connessione sicura,
 // che dichiara buono il programma nuovo (25/11/2026: con il bus aperto prima del wifi un programma non arrivava a parlare col PC).
@@ -833,7 +868,9 @@ static void parla(void *arg)
             if (segui && (int32_t)(adesso_ms() - prossima) >= 0) {
                 segui = chiedi_stato_voce(risposta);
                 prossima = adesso_ms() + riprova_voce;
+                if (!segui) ponte_chiudi();   // niente piu' da chiedere: la connessione al ponte si chiude
             }
+            ponte_pulisci();   // e se e' rimasta aperta da troppo (un altro compito l'ha usata), si chiude qui
             continue;
         }
         // Nessun caso muto (25/11/2026): ogni pressione da' un segno, anche quando non si puo' registrare.
