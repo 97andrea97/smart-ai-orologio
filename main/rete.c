@@ -88,6 +88,21 @@ static void segna_trasporto(esp_http_client_handle_t cl, const char *fase_rete, 
     segna_motivo(fase_rete, dettaglio);
 }
 
+// DNS di ripiego (26/11/2026): con l'hotspot del telefono l'orologio funzionava, sulla wifi di casa no; il DNS lo dava solo
+// il modem. Il principale resta quello del DHCP; se la rete non ne ha dato un secondo, il secondo e' 1.1.1.1 (Cloudflare,
+// lo stesso fornitore del ponte: SCELTA DA CONFERMARE con Andrea). lwIP passa al secondo solo quando il primo non risponde.
+// API di esp_netif v5.5.5 (esp_netif.h): il secondo (BACKUP) puo' darlo anche il DHCP, quindi si guarda prima.
+static void dns_di_ripiego(void)
+{
+    if (!netif_sta) return;
+    esp_netif_dns_info_t d = { 0 };
+    if (esp_netif_get_dns_info(netif_sta, ESP_NETIF_DNS_BACKUP, &d) == ESP_OK && d.ip.type == ESP_IPADDR_TYPE_V4
+        && d.ip.u_addr.ip4.addr != 0) return;   // il DHCP ne ha dato due: restano quelli
+    esp_netif_dns_info_t ripiego = { .ip = ESP_IP4ADDR_INIT(1, 1, 1, 1) };
+    esp_err_t e = esp_netif_set_dns_info(netif_sta, ESP_NETIF_DNS_BACKUP, &ripiego);
+    if (e != ESP_OK) ESP_LOGW(TAG, "DNS di ripiego non impostato: %s", esp_err_to_name(e));
+}
+
 static void prova_rete(int i)
 {
     wifi_config_t wc = { 0 };
@@ -113,6 +128,7 @@ static void evento(void *arg, esp_event_base_t base, int32_t id, void *dati)
         rete_corrente = (rete_corrente + 1) % n_reti;   // la prossima rete salvata, a giro
         prova_rete(rete_corrente);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        dns_di_ripiego();   // prima di dichiararsi collegata: il primo scambio ha gia' il secondo DNS
         fase = RETE_COLLEGATA;
         ESP_LOGI(TAG, "collegato a %s", reti[rete_corrente].ssid);
         xEventGroupSetBits(eventi, BIT_COLLEGATA);
