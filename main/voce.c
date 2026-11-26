@@ -35,6 +35,7 @@ static int16_t grezzo[LETTURA_FRAME * POSTI_TDM];
 // cio' che aveva preso: e' la memoria che c'era prima del tentativo.
 static char errore[160];
 const char *voce_errore(void) { return errore; }
+volatile size_t voce_campioni_pronti = 0;
 static void segna(const char *passo, esp_err_t e)
 {
     snprintf(errore, sizeof errore, "%s: %s\nDMA libera %u, blocco %u\ninterna %u, PSRAM %uk",
@@ -86,6 +87,7 @@ long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void))
     size_t n = 0;
     bool ok = true;
     int32_t picco = 0;
+    voce_campioni_pronti = 0;
     while (n < max_campioni && continua()) {
         if (esp_codec_dev_read(microfoni, grezzo, sizeof grezzo) != ESP_CODEC_DEV_OK) { segna("lettura", ESP_OK); ok = false; break; }
         for (int f = 0; f < LETTURA_FRAME && n < max_campioni; f++) {
@@ -94,6 +96,8 @@ long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void))
             if (m < 0) m = -m;
             if (m > picco) picco = m;
         }
+        __sync_synchronize();        // i campioni scritti prima del numero che li rende visibili all'altro compito
+        voce_campioni_pronti = n;
     }
     // Come bsp_extra_codec_dev_stop: prima l'ingresso, poi l'uscita.
     esp_codec_dev_close(microfoni);
@@ -261,35 +265,51 @@ bool voce_prova_suono(char *esito, size_t cap)
     return ok;
 }
 
+bool voce_giro_apri(voce_giro_t *g)
+{
+    // Il pezzo in base64 (4 caratteri ogni 3 byte) dentro il JSON; nella PSRAM, come la busta (rete.c).
+    g->cap_json = 4 * ((VOCE_PEZZO_BYTE + 2) / 3) + 160;
+    g->json = heap_caps_malloc(g->cap_json, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g->json) { ESP_LOGE(TAG, "memoria per il pezzo"); return false; }
+    snprintf(g->r, sizeof g->r, "%08lx", (unsigned long)esp_random());   // id della registrazione, non un segreto
+    g->i = 0;
+    return true;
+}
+
+void voce_giro_chiudi(voce_giro_t *g)
+{
+    free(g->json);
+    g->json = NULL;
+}
+
+ponte_esito_t voce_giro_pezzo(voce_giro_t *g, const int16_t *pcm, size_t campioni, bool fine, char *risposta, size_t cap)
+{
+    const size_t lung = campioni * 2;
+    if (!g->json || lung == 0 || lung > VOCE_PEZZO_BYTE) return PONTE_ERRORE;
+    int h = snprintf(g->json, g->cap_json, "{\"t\":\"voce\",\"r\":\"%s\",\"i\":%d,\"fine\":%s,\"hz\":%d,\"pcm\":\"",
+                     g->r, g->i, fine ? "true" : "false", VOCE_HZ);
+    size_t scritti = 0;
+    if (h < 0 || mbedtls_base64_encode((unsigned char *)g->json + h, g->cap_json - (size_t)h - 3, &scritti,
+                                       (const unsigned char *)pcm, lung) != 0) return PONTE_ERRORE;
+    memcpy(g->json + h + scritti, "\"}", 3);
+    ponte_esito_t esito = ponte_manda(g->json, (size_t)h + scritti + 2, fine, risposta, cap);
+    if (esito != PONTE_OK) ESP_LOGW(TAG, "pezzo %d%s: %s", g->i + 1, fine ? " (ultimo)" : "", ponte_esito_testo(esito));
+    else g->i++;
+    return esito;
+}
+
 ponte_esito_t voce_spedisci(const int16_t *pcm, size_t campioni, char *risposta, size_t cap)
 {
-    const size_t byte = campioni * 2;
-    if (byte == 0) return PONTE_ERRORE;
-    // Il pezzo in base64 (4 caratteri ogni 3 byte) dentro il JSON; nella PSRAM, come la busta (rete.c).
-    const size_t cap_json = 4 * ((VOCE_PEZZO_BYTE + 2) / 3) + 160;
-    char *json = heap_caps_malloc(cap_json, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!json) { ESP_LOGE(TAG, "memoria per il pezzo"); return PONTE_ERRORE; }
-    char reg[9];
-    snprintf(reg, sizeof reg, "%08lx", (unsigned long)esp_random());   // id della registrazione, non un segreto
-
-    const int n_pezzi = (int)((byte + VOCE_PEZZO_BYTE - 1) / VOCE_PEZZO_BYTE);
+    if (campioni == 0) return PONTE_ERRORE;
+    voce_giro_t g;
+    if (!voce_giro_apri(&g)) return PONTE_ERRORE;
+    const size_t per_pezzo = VOCE_PEZZO_BYTE / 2;
     ponte_esito_t esito = PONTE_ERRORE;
-    for (int i = 0; i < n_pezzi; i++) {
-        const size_t da = (size_t)i * VOCE_PEZZO_BYTE;
-        const size_t lung = byte - da < VOCE_PEZZO_BYTE ? byte - da : VOCE_PEZZO_BYTE;
-        const bool fine = i == n_pezzi - 1;
-        int h = snprintf(json, cap_json, "{\"t\":\"voce\",\"r\":\"%s\",\"i\":%d,\"fine\":%s,\"hz\":%d,\"pcm\":\"",
-                         reg, i, fine ? "true" : "false", VOCE_HZ);
-        size_t scritti = 0;
-        if (h < 0 || mbedtls_base64_encode((unsigned char *)json + h, cap_json - (size_t)h - 3, &scritti,
-                                           (const unsigned char *)pcm + da, lung) != 0) {
-            esito = PONTE_ERRORE;
-            break;
-        }
-        memcpy(json + h + scritti, "\"}", 3);
-        esito = ponte_manda(json, (size_t)h + scritti + 2, fine, risposta, cap);
-        if (esito != PONTE_OK) { ESP_LOGW(TAG, "pezzo %d di %d: %s", i + 1, n_pezzi, ponte_esito_testo(esito)); break; }
+    for (size_t da = 0; da < campioni; da += per_pezzo) {
+        const size_t n = campioni - da < per_pezzo ? campioni - da : per_pezzo;
+        esito = voce_giro_pezzo(&g, pcm + da, n, da + n >= campioni, risposta, cap);
+        if (esito != PONTE_OK) break;
     }
-    free(json);
+    voce_giro_chiudi(&g);
     return esito;
 }

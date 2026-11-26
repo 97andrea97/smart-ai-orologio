@@ -872,6 +872,40 @@ static bool chiedi_stato_voce(char *risposta)
     return !fine;
 }
 
+// ---- audio a pezzi mentre registra (26/11/2026) ------------------------------------------------------------------
+// Prima l'audio partiva tutto al rilascio di BOOT (giro delle 16:56: invio 23,6 s). Ora un compito piccolo legge i
+// microfoni e `parla` manda i pezzi gia' pronti (voce.h, VOCE_FLUSSO_*): al rilascio resta circa l'ultimo secondo.
+// Il compito che manda e' `parla` (pila in memoria interna), perche' ogni busta salva il contatore nella flash.
+// La connessione sicura si apre solo dopo i microfoni (prima il contrario aveva tolto memoria all'I2S, LEZIONI_OROLOGIO.md).
+// Ripiego: se un pezzo intermedio fallisce o il PC risponde "incompleto", tutto da capo come prima (voce_spedisci, giro
+// nuovo: il PC butta quello a meta'). Se fallisce l'ultimo pezzo no: il PC potrebbe averlo gia' preso (doppio messaggio).
+#define PILA_REGISTRATORE 4096   // memoria interna: voce_registra legge in un buffer statico, il resto e' poco
+typedef struct {
+    int16_t *pcm;
+    size_t max;
+    volatile long n;
+    volatile bool finito;
+} registrazione_t;
+static registrazione_t registrazione;
+
+static void registratore(void *arg)
+{
+    registrazione_t *g = (registrazione_t *)arg;
+    g->n = voce_registra(g->pcm, g->max, continua_registrazione);
+    __sync_synchronize();
+    g->finito = true;
+    vTaskDelete(NULL);
+}
+
+static bool risposta_incompleta(const char *risposta)
+{
+    cJSON *r = cJSON_Parse(risposta);
+    cJSON *m = r ? cJSON_GetObjectItemCaseSensitive(r, "motivo") : NULL;
+    bool si = cJSON_IsString(m) && strcmp(m->valuestring, "incompleto") == 0;
+    cJSON_Delete(r);
+    return si;
+}
+
 // Registra finche' BOOT resta giu', poi manda. Torna true se c'e' un messaggio di cui seguire la risposta.
 static bool registra_e_manda(char *risposta)
 {
@@ -889,7 +923,35 @@ static bool registra_e_manda(char *risposta)
     vibra(40);
     inizio_registrazione = adesso_ms();
     ultimo_secondo = UINT32_MAX;
-    long n = voce_registra(pcm, max, continua_registrazione);
+    registrazione = (registrazione_t){ .pcm = pcm, .max = max, .n = 0, .finito = false };
+    voce_campioni_pronti = 0;
+    voce_giro_t giro;
+    bool flusso = voce_giro_apri(&giro);
+    if (xTaskCreate(registratore, "registra", PILA_REGISTRATORE, &registrazione, 6, NULL) != pdPASS) {
+        // Niente posto per il compito: si registra qui e si manda tutto dopo, come prima.
+        ESP_LOGW(TAG, "voce: compito di registrazione non creato, invio dopo il rilascio");
+        flusso = false;
+        registrazione.n = voce_registra(pcm, max, continua_registrazione);
+        registrazione.finito = true;
+    }
+    const size_t pezzo_min = (size_t)VOCE_HZ * VOCE_FLUSSO_MIN_MS / 1000;
+    const size_t riserva = (size_t)VOCE_HZ * VOCE_FLUSSO_RISERVA_MS / 1000;
+    const size_t pezzo_max = VOCE_PEZZO_BYTE / 2;
+    size_t inviati = 0;
+    while (!registrazione.finito) {
+        const size_t pronti = voce_campioni_pronti;
+        if (flusso && pronti >= inviati + pezzo_min + riserva) {
+            size_t lung = pronti - riserva - inviati;
+            if (lung > pezzo_max) lung = pezzo_max;
+            if (voce_giro_pezzo(&giro, pcm + inviati, lung, false, risposta, RISPOSTA_VOCE_CAP) == PONTE_OK) inviati += lung;
+            else flusso = false;   // il resto al rilascio, tutto da capo (ripiego)
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    __sync_synchronize();
+    long n = registrazione.n;
+    if (n < 0 || (uint32_t)n * 1000u / VOCE_HZ < VOCE_MIN_MS) voce_giro_chiudi(&giro);   // il PC butta il giro a meta' da solo
     if (n < 0) {
         free(pcm);
         char riga[200];   // 27 di testo fisso + voce_errore (al massimo 159)
@@ -900,9 +962,33 @@ static bool registra_e_manda(char *risposta)
     char riga[80];
     snprintf(riga, sizeof riga, "Invio %ld s di audio...%s", n / VOCE_HZ, (size_t)n >= max ? "\n(durata massima raggiunta)" : "");
     stato_voce(riga, true);
+    // Invio = dal rilascio alla risposta all'ultimo pezzo, ripiego compreso (schermo e telemetria).
     const uint32_t t_invio = adesso_ms();
-    ponte_esito_t e = voce_spedisci(pcm, (size_t)n, risposta, RISPOSTA_VOCE_CAP);
+    const size_t gia_partiti = inviati;
+    ponte_esito_t e = PONTE_ERRORE;
+    bool intero = !flusso || inviati == 0;
+    if (!intero) {
+        // Il resto, a pezzi da VOCE_PEZZO_BYTE al massimo; l'ultimo aspetta la risposta.
+        for (;;) {
+            size_t lung = (size_t)n - inviati;
+            const bool fine = lung <= pezzo_max;
+            if (!fine) lung = pezzo_max;
+            e = voce_giro_pezzo(&giro, pcm + inviati, lung, fine, risposta, RISPOSTA_VOCE_CAP);
+            if (e != PONTE_OK) { if (!fine) intero = true; break; }
+            inviati += lung;
+            if (fine) break;
+        }
+        if (e == PONTE_OK && risposta_incompleta(risposta)) intero = true;
+    }
+    voce_giro_chiudi(&giro);
+    if (intero) {
+        if (gia_partiti > 0) ESP_LOGW(TAG, "voce: ripiego, tutto da capo dopo %u campioni partiti mentre registrava", (unsigned)gia_partiti);
+        memset(risposta, 0, RISPOSTA_VOCE_CAP);
+        e = voce_spedisci(pcm, (size_t)n, risposta, RISPOSTA_VOCE_CAP);
+    }
     ms_invio = adesso_ms() - t_invio;
+    ESP_LOGI(TAG, "voce: %ld campioni, %u partiti mentre registrava%s, invio dopo il rilascio %lu ms",
+             n, (unsigned)gia_partiti, intero ? " (invio intero)" : "", (unsigned long)ms_invio);
     ms_attesa = 0;
     ms_scarico = 0;
     free(pcm);

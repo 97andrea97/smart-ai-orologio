@@ -33,8 +33,30 @@ const char *voce_errore(void);
 // Registra in `pcm` (mono, VOCE_HZ, 16 bit) finche' continua() dice true o il posto finisce. Torna i campioni
 // scritti, oppure -1 se i microfoni non si aprono o non si leggono.
 long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void));
+// Campioni gia' scritti in `pcm` dalla registrazione in corso: voce_registra li aggiorna dopo ogni lettura, cosi' un altro
+// compito puo' mandarli mentre si registra (26/11/2026, audio a pezzi).
+extern volatile size_t voce_campioni_pronti;
 // Manda la registrazione al PC a pezzi; solo l'ultimo aspetta la risposta, che finisce in `risposta`.
 ponte_esito_t voce_spedisci(const int16_t *pcm, size_t campioni, char *risposta, size_t cap);
+
+// Audio a pezzi mentre registra (26/11/2026, STATO.md del PC "Audio a pezzi dall'orologio"): un pezzo parte appena ci sono
+// VOCE_FLUSSO_MIN_MS di audio nuovo (fino a VOCE_PEZZO_BYTE se la rete resta indietro); VOCE_FLUSSO_RISERVA_MS restano
+// sempre per il rilascio, cosi' l'ultimo pezzo (fine:true) non e' mai vuoto. Scelte nostre, da misurare al polso: con
+// pezzi piu' piccoli al rilascio resta meno audio ma ogni pezzo costa una richiesta (e un contatore salvato).
+#define VOCE_FLUSSO_MIN_MS 1000
+#define VOCE_FLUSSO_RISERVA_MS 100
+// Un giro di pezzi: stesso id `r`, indice che cresce, JSON nella PSRAM.
+typedef struct {
+    char r[9];
+    int i;
+    char *json;
+    size_t cap_json;
+} voce_giro_t;
+// Prepara un giro (id nuovo, JSON per un pezzo da VOCE_PEZZO_BYTE nella PSRAM). false se manca la memoria.
+bool voce_giro_apri(voce_giro_t *g);
+// Manda `campioni` (al massimo VOCE_PEZZO_BYTE / 2) come pezzo successivo del giro; con fine=true aspetta la risposta.
+ponte_esito_t voce_giro_pezzo(voce_giro_t *g, const int16_t *pcm, size_t campioni, bool fine, char *risposta, size_t cap);
+void voce_giro_chiudi(voce_giro_t *g);
 // Fa sentire `pcm` (mono, VOCE_HZ, 16 bit) dall'altoparlante finche' continua() dice true. Stessa apertura del bus della
 // registrazione (uscita e microfoni insieme, come il firmware di fabbrica), con l'uscita accesa. false se non si apre
 // o non si scrive (il passo in voce_errore()).
