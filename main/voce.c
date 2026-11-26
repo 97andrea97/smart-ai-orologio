@@ -100,6 +100,49 @@ long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void))
     return ok ? (long)n : -1;
 }
 
+// Risposta letta (26/11/2026). L'apertura e' quella di voce_registra, che sull'orologio funziona: uscita stereo a VOCE_HZ,
+// poi l'ingresso a 4 posti (non letto: i campioni in arrivo si perdono, come nel lettore del firmware di fabbrica, che
+// imposta sempre tutte e due le direzioni). Niente memoria nuova: il mono diventa stereo in `grezzo` (2 KB gia' riservati,
+// 512 frame), perche' registrare e ascoltare non succedono mai insieme (tutti e due li chiama solo il compito della voce).
+#define FRAME_USCITA (LETTURA_FRAME * POSTI_TDM / 2)
+// Silenzio in coda prima di chiudere: svuota i buffer DMA dell'uscita (6 x 240 frame, 60 ms a 24 kHz, I2S_CHANNEL_DEFAULT_CONFIG)
+// cosi' l'ultima parola non si taglia e non si ripete. Sei giri da 512 frame, circa 128 ms.
+#define GIRI_SILENZIO 6
+
+bool voce_riproduci(const int16_t *pcm, size_t campioni, bool (*continua)(void))
+{
+    if (!voce_avvia()) return false;
+    esp_codec_dev_sample_info_t uscita = { .sample_rate = VOCE_HZ, .channel = 2, .bits_per_sample = 16 };
+    esp_codec_dev_sample_info_t ingresso = {
+        .sample_rate = VOCE_HZ, .channel = POSTI_TDM, .channel_mask = POSTI_TUTTI, .bits_per_sample = 16,
+    };
+    if (esp_codec_dev_open(altoparlante, &uscita) != ESP_CODEC_DEV_OK) { segna("apertura uscita", ESP_OK); return false; }
+    esp_codec_dev_set_out_mute(altoparlante, true);
+    if (esp_codec_dev_open(microfoni, &ingresso) != ESP_CODEC_DEV_OK) {
+        segna("apertura microfoni", ESP_OK);
+        esp_codec_dev_close(altoparlante);
+        return false;
+    }
+    if (esp_codec_dev_set_out_vol(altoparlante, VOCE_VOLUME) != ESP_CODEC_DEV_OK) ESP_LOGW(TAG, "volume non impostato");
+    esp_codec_dev_set_out_mute(altoparlante, false);
+
+    size_t n = 0;
+    bool ok = true;
+    while (n < campioni && continua()) {
+        size_t k = campioni - n < FRAME_USCITA ? campioni - n : FRAME_USCITA;
+        for (size_t f = 0; f < k; f++) grezzo[2 * f] = grezzo[2 * f + 1] = pcm[n + f];
+        if (esp_codec_dev_write(altoparlante, grezzo, (int)(k * 4)) != ESP_CODEC_DEV_OK) { segna("scrittura", ESP_OK); ok = false; break; }
+        n += k;
+    }
+    memset(grezzo, 0, sizeof grezzo);
+    for (int g = 0; ok && g < GIRI_SILENZIO; g++) esp_codec_dev_write(altoparlante, grezzo, (int)sizeof grezzo);
+    esp_codec_dev_set_out_mute(altoparlante, true);
+    esp_codec_dev_close(microfoni);
+    esp_codec_dev_close(altoparlante);
+    ESP_LOGI(TAG, "letti %u campioni su %u%s", (unsigned)n, (unsigned)campioni, ok ? "" : ", scrittura fallita");
+    return ok;
+}
+
 ponte_esito_t voce_spedisci(const int16_t *pcm, size_t campioni, char *risposta, size_t cap)
 {
     const size_t byte = campioni * 2;

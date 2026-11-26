@@ -3,7 +3,8 @@
 // Giro 2 (24/11/2026): abbinamento col cavo (seriale.c), wifi e ponte (rete.c), PIN sul tastierino.
 // Giro 3 (25/11/2026): aggiornamento via wifi (aggiorna.c), batteria, schermo che si spegne, ora; sblocco col gesto.
 // Voce (25/11/2026): da sbloccato, BOOT tenuto premuto registra, al rilascio l'audio va al PC (voce.c); poi l'orologio
-// chiede lo stato finche' arriva la risposta, che si legge nel pannello della voce.
+// chiede lo stato finche' arriva la risposta, che si legge nel pannello della voce e (26/11/2026) si ascolta
+// dall'altoparlante, con la voce preparata dal PC.
 // Nessun segreto nel codice: wifi, indirizzo del ponte, gettone e chiave delle buste li scrive la
 // pagina Orologio dell'app attraverso il cavo, e restano nella memoria dell'orologio (memoria.c).
 // Il PIN non resta nell'orologio: va al PC dentro una busta cifrata, il PC lo confronta con l'impronta.
@@ -33,6 +34,7 @@
 #include "voce.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "smart-ai";
 
@@ -184,7 +186,8 @@ static void mostra_voce(const char *testo, bool sveglia)
     bsp_display_unlock();
 }
 
-static void tocco_chiudi_voce(lv_event_t *e) { (void)e; visibile(pannello_voce, false); }   // callback di LVGL: blocco gia' preso
+static volatile bool ferma_ascolto = false;   // la risposta letta (piu' sotto, "risposta a voce"): Chiudi la ferma
+static void tocco_chiudi_voce(lv_event_t *e) { (void)e; ferma_ascolto = true; visibile(pannello_voce, false); }   // callback di LVGL: blocco gia' preso
 
 static void cambiato_dal_cavo(void)
 {
@@ -545,6 +548,92 @@ static void rifiuto_voce(const char *motivo)
     mostra_voce(riga, true);
 }
 
+// ---- risposta a voce (26/11/2026) -----------------------------------------------------------------------
+// Quando la risposta e' pronta e il PC dice "parla", l'orologio scarica la risposta letta dal PC (voce_audio, a pezzi da
+// VOCE_PEZZO_BYTE, PROTOCOLLO.md del PC) e la fa sentire dall'altoparlante. Prima scarica tutto e poi suona: niente
+// pause a meta' frase mentre arriva il pezzo dopo (costo: qualche secondo di attesa in piu'). BOOT o Chiudi la fermano;
+// BOOT tenuto giu' registra subito un messaggio nuovo (il giro di `parla` vede il tasto premuto).
+// ferma_ascolto e' dichiarato accanto a tocco_chiudi_voce, che lo accende.
+static bool ascolto_fermato = false;
+
+static bool continua_ascolto(void)
+{
+    if (ferma_ascolto || leggi_boot()) { ascolto_fermato = true; return false; }
+    return true;
+}
+
+// Scarica e fa sentire la risposta di id_voce. NULL se e' andato tutto bene, altrimenti la riga per lo schermo.
+static const char *ascolta_risposta(void)
+{
+    char *buf = (char *)heap_caps_malloc(RISPOSTA_AUDIO_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) return "voce non scaricata: PSRAM piena";
+    int16_t *pcm = NULL;
+    size_t campioni = 0, pezzi = 1;
+    bool tagliata = false;
+    const char *esito = NULL;
+    ascolto_fermato = false;
+    for (size_t i = 0; i < pezzi && !esito; i++) {
+        if (ferma_ascolto || gpio_get_level(TASTO_BOOT) == 0) { ascolto_fermato = true; break; }
+        char json[96];
+        snprintf(json, sizeof json, "{\"t\":\"voce_audio\",\"id\":\"%.36s\",\"i\":%u}", id_voce, (unsigned)i);
+        // Un pezzo perso si chiede ancora una volta, poi si rinuncia (il testo e' gia' a schermo).
+        ponte_esito_t e = PONTE_ERRORE;
+        for (int t = 0; t < 2 && e != PONTE_OK; t++) e = ponte_scambia(json, buf, RISPOSTA_AUDIO_CAP);
+        if (e != PONTE_OK) { esito = ponte_esito_testo(e); break; }
+        cJSON *r = cJSON_Parse(buf);
+        cJSON *p = r ? cJSON_GetObjectItemCaseSensitive(r, "pcm") : NULL;
+        if (!r || !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok")) || !cJSON_IsString(p)) {
+            esito = "voce non disponibile";
+            cJSON_Delete(r);
+            break;
+        }
+        if (i == 0) {
+            // Il primo pezzo dice quanto e' lunga la risposta: si controlla e si riserva tutto nella PSRAM.
+            cJSON *hz = cJSON_GetObjectItemCaseSensitive(r, "hz");
+            cJSON *nc = cJSON_GetObjectItemCaseSensitive(r, "campioni");
+            cJSON *np = cJSON_GetObjectItemCaseSensitive(r, "pezzi");
+            double c = cJSON_IsNumber(nc) ? nc->valuedouble : 0;
+            if (!cJSON_IsNumber(hz) || hz->valueint != VOCE_HZ || c < 1 || c > (double)VOCE_MAX_S * VOCE_HZ || !cJSON_IsNumber(np)) {
+                esito = "voce in un formato sconosciuto";
+            } else {
+                campioni = (size_t)c;
+                pezzi = (campioni * 2 + VOCE_PEZZO_BYTE - 1) / VOCE_PEZZO_BYTE;
+                tagliata = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "tagliata"));
+                if ((size_t)np->valueint != pezzi) esito = "voce in un formato sconosciuto";
+                else if (!(pcm = (int16_t *)heap_caps_malloc(campioni * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))) esito = "voce non scaricata: PSRAM piena";
+            }
+        }
+        if (!esito) {
+            const size_t da = i * VOCE_PEZZO_BYTE;
+            const size_t attesi = campioni * 2 - da < VOCE_PEZZO_BYTE ? campioni * 2 - da : VOCE_PEZZO_BYTE;
+            size_t scritti = 0;
+            if (mbedtls_base64_decode((unsigned char *)pcm + da, attesi, &scritti, (const unsigned char *)p->valuestring,
+                                      strlen(p->valuestring)) != 0 || scritti != attesi) esito = "voce arrivata male";
+        }
+        cJSON_Delete(r);
+    }
+    free(buf);   // prima di suonare: 256 KB di PSRAM tornano liberi
+    if (!esito && !ascolto_fermato && pcm) {
+        if (!voce_riproduci(pcm, campioni, continua_ascolto)) esito = "altoparlante non disponibile";
+        else if (tagliata && !ascolto_fermato) esito = "voce tagliata: il resto e' nell'app";
+    }
+    free(pcm);
+    return esito;
+}
+
+// La riga sotto la risposta mentre la voce arriva, e cosa e' andato storto (se qualcosa).
+static void ascolta(void)
+{
+    const size_t cap = RISPOSTA_VOCE_CAP + 64, base = strlen(schermo_voce);
+    ferma_ascolto = false;
+    snprintf(schermo_voce + base, cap - base, "\n\n(voce in arrivo...)");
+    mostra_voce(schermo_voce, false);
+    const char *esito = ascolta_risposta();
+    if (esito) snprintf(schermo_voce + base, cap - base, "\n\n(%.80s)", esito);
+    else schermo_voce[base] = 0;
+    mostra_voce(schermo_voce, false);
+}
+
 // Una richiesta di stato. Torna true se bisogna continuare a chiedere.
 static bool chiedi_stato_voce(char *risposta)
 {
@@ -584,7 +673,10 @@ static bool chiedi_stato_voce(char *risposta)
     mostra_voce(schermo_voce, fine);
     if (fine) { if (con_risposta) vibra_due(); else vibra(60); }
     else riprova_voce = riprova_da(r);
+    // 26/11/2026: con la risposta pronta, e se il PC la ha letta e Silenzioso e' spento, la si ascolta dall'altoparlante.
+    bool parla = fine && con_risposta && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "parla"));
     cJSON_Delete(r);
+    if (parla) ascolta();
     return !fine;
 }
 
