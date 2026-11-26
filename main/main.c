@@ -46,7 +46,13 @@ static TaskHandle_t compito_motore = NULL;
 static QueueHandle_t richieste = NULL;     // messaggi JSON da spedire al PC, uno per volta
 
 static lv_obj_t *etichetta_ora, *etichetta_stato, *etichetta_messaggio, *riquadro_sbloccato;
-static lv_obj_t *pannello_voce = NULL, *testo_voce = NULL;   // trascritto e risposta, scorrevole, con Chiudi
+// Pannello della voce: l'ultima risposta (testo_voce) con in cima la riga dei suoi tempi (etichetta_tempi), scorrevole, con Chiudi.
+// Cio' che l'orologio sta facendo (registro, invio, attendo...) NON va qui ma nella fascia di stato, cioe' in etichetta_messaggio
+// sopra il pannello (26/11/2026: premere BOOT cancellava l'ultima risposta e i tempi, che servono ancora da leggere).
+static lv_obj_t *pannello_voce = NULL, *testo_voce = NULL, *etichetta_tempi = NULL;
+// La fascia di stato: due righe del carattere da 18 px, e un testo piu' lungo si accorcia con "..." (il testo intero va al PC, telemetria.c).
+#define FASCIA_ALTEZZA 44
+#define FASCIA_MAX_CAR 72
 // Prova dell'altoparlante (26/11/2026): il tasto "Prova suono" sta sempre in vista, anche da bloccato, e il suo esito va nello stesso
 // pannello. Da bloccato il pannello si richiudeva da solo (aggiorna_bloccato): con pannello_fisso resta fino a Chiudi.
 static volatile bool pannello_fisso = false;
@@ -174,9 +180,30 @@ static void messaggio(const char *testo)
     bsp_display_unlock();
 }
 
-// Il pannello della voce. `sveglia`: riaccende lo schermo e mostra il pannello (registrazione, risposta arrivata,
-// errore). Senza, cambia solo il testo: mentre si aspetta la risposta lo schermo non si riaccende (batteria) e un
-// pannello chiuso con Chiudi resta chiuso fino alla risposta.
+// La fascia di stato della voce (registro, invio, attendo, errori): una zona piccola sopra il pannello, che lascia in vista l'ultima
+// risposta e i suoi tempi. `sveglia`: riaccende lo schermo. Il pannello non si apre e non si chiude: lo apre la risposta nuova.
+static void stato_voce(const char *testo, bool sveglia)
+{
+    char riga[FASCIA_MAX_CAR + 1];
+    const size_t n = strlen(testo);
+    if (n > FASCIA_MAX_CAR) {
+        memcpy(riga, testo, FASCIA_MAX_CAR - 3);
+        memcpy(riga + FASCIA_MAX_CAR - 3, "...", 4);
+    } else {
+        memcpy(riga, testo, n + 1);
+    }
+    bsp_display_lock(0);
+    lv_label_set_text(etichetta_messaggio, riga);
+    if (sveglia) {
+        accendi_bloccato();
+        lv_display_trigger_activity(NULL);
+    }
+    bsp_display_unlock();
+}
+
+// Il pannello della voce con la risposta. `sveglia`: riaccende lo schermo e mostra il pannello (risposta arrivata). Senza,
+// cambia solo il testo: mentre si aspetta la risposta lo schermo non si riaccende (batteria) e un pannello chiuso con
+// Chiudi resta chiuso fino alla risposta.
 static void mostra_voce(const char *testo, bool sveglia)
 {
     bsp_display_lock(0);
@@ -201,6 +228,7 @@ static void tocco_prova_suono(lv_event_t *e)
     vibra(30);
     pannello_fisso = true;
     lv_label_set_text(testo_voce, "Prova suono: tra un attimo senti un tono (1000 Hz, 1 secondo)...");
+    visibile(etichetta_tempi, false);   // la prova prende il posto dell'ultima risposta: i suoi tempi non le appartengono
     visibile(pannello_voce, true);
     lv_obj_scroll_to_y(pannello_voce, 0, LV_ANIM_OFF);
     prova_suono_richiesta = true;
@@ -342,6 +370,7 @@ static void disegna(void)
 
     etichetta_messaggio = lv_label_create(schermo);
     lv_obj_set_width(etichetta_messaggio, 370);
+    lv_obj_set_height(etichetta_messaggio, FASCIA_ALTEZZA);   // fascia di stato: sotto comincia il pannello della voce
     lv_label_set_long_mode(etichetta_messaggio, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(etichetta_messaggio, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(etichetta_messaggio, &lv_font_montserrat_18, 0);
@@ -394,10 +423,11 @@ static void disegna(void)
     lv_label_set_text_fmt(versione, "v %s", esp_app_get_description()->version);
     lv_obj_align(versione, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    // Pannello della voce: copre i tasti da sbloccato, sotto l'ora; il testo lungo scorre col dito, Chiudi in fondo.
+    // Pannello della voce: copre i tasti da sbloccato, sotto l'ora e sotto la fascia di stato (etichetta_messaggio, y 96-140);
+    // i tempi in cima, il testo lungo scorre col dito, Chiudi in fondo.
     pannello_voce = lv_obj_create(schermo);
     lv_obj_remove_style_all(pannello_voce);
-    lv_obj_set_size(pannello_voce, 390, 380);
+    lv_obj_set_size(pannello_voce, 390, 330);
     lv_obj_align(pannello_voce, LV_ALIGN_BOTTOM_MID, 0, -24);
     lv_obj_set_style_bg_color(pannello_voce, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(pannello_voce, LV_OPA_COVER, 0);
@@ -407,6 +437,13 @@ static void disegna(void)
     lv_obj_set_style_pad_bottom(pannello_voce, 16, 0);
     lv_obj_add_flag(pannello_voce, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(pannello_voce, LV_DIR_VER);
+    etichetta_tempi = lv_label_create(pannello_voce);   // prima del testo: in cima, si legge senza scorrere; nascosta finche' non c'e' un giro misurato
+    lv_obj_set_width(etichetta_tempi, 370);
+    lv_label_set_long_mode(etichetta_tempi, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(etichetta_tempi, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(etichetta_tempi, lv_color_hex(COLORE_STATO), 0);
+    lv_label_set_text(etichetta_tempi, "");
+    lv_obj_add_flag(etichetta_tempi, LV_OBJ_FLAG_HIDDEN);
     testo_voce = lv_label_create(pannello_voce);
     lv_obj_set_width(testo_voce, 370);
     lv_label_set_long_mode(testo_voce, LV_LABEL_LONG_WRAP);
@@ -548,7 +585,7 @@ static bool continua_registrazione(void)
         ultimo_secondo = s;
         char riga[64];
         snprintf(riga, sizeof riga, "Ti ascolto... %lu s\nRilascia BOOT per inviare", (unsigned long)s);
-        mostra_voce(riga, true);
+        stato_voce(riga, true);
     }
     return leggi_boot();
 }
@@ -576,7 +613,7 @@ static void rifiuto_voce(const char *motivo)
     else if (strcmp(motivo, "troppo_lungo") == 0) snprintf(riga, sizeof riga, "Audio troppo lungo per il PC");
     else if (strcmp(motivo, "troppi_aperti") == 0) snprintf(riga, sizeof riga, "Troppi messaggi aperti: chiudine qualcuno nell'app");
     else snprintf(riga, sizeof riga, "Il PC dice: %.60s", motivo);
-    mostra_voce(riga, true);
+    stato_voce(riga, true);
 }
 
 // ---- risposta a voce (26/11/2026) -----------------------------------------------------------------------
@@ -598,6 +635,18 @@ static void riga_tempi(char *dst, size_t cap, bool con_scarico)
 {
     int n = snprintf(dst, cap, "invio %u,%u s, risposta dopo %u,%u s", DECIMI(ms_invio), DECIMI(ms_attesa));
     if (con_scarico && n > 0 && (size_t)n < cap) snprintf(dst + n, cap - (size_t)n, ", scarico %u,%u s", DECIMI(ms_scarico));
+}
+
+// La riga dei tempi va in cima al pannello, sopra la risposta (26/11/2026: prima stava in fondo al testo e premere BOOT la
+// cancellava insieme alla risposta). Resta fino alla risposta del giro dopo: e' quella dell'ultima risposta.
+static void mostra_tempi(bool con_scarico)
+{
+    char riga[96];
+    riga_tempi(riga, sizeof riga, con_scarico);
+    bsp_display_lock(0);
+    lv_label_set_text(etichetta_tempi, riga);
+    lv_obj_remove_flag(etichetta_tempi, LV_OBJ_FLAG_HIDDEN);
+    bsp_display_unlock();
 }
 
 static bool continua_ascolto(void)
@@ -682,25 +731,21 @@ static void ascolta(void)
     if (esito) snprintf(schermo_voce + base, cap - base, "\n\n(%.80s)", esito);
     else if (ascolto_fermato) snprintf(schermo_voce + base, cap - base, "\n\n(voce interrotta)");
     else snprintf(schermo_voce + base, cap - base, "\n\n(voce suonata, %u s)", secondi_voce);
-    // Sotto, i tempi del giro (26/11/2026): quanto e' durato l'invio, l'attesa della risposta e lo scaricamento della voce.
-    const size_t dopo = strlen(schermo_voce);
-    if (dopo + 2 < cap) {
-        schermo_voce[dopo] = '\n';
-        riga_tempi(schermo_voce + dopo + 1, cap - dopo - 1, true);
-    }
     mostra_voce(schermo_voce, false);
+    // In cima al pannello i tempi del giro (26/11/2026): quanto e' durato l'invio, l'attesa della risposta e lo scaricamento della voce.
+    mostra_tempi(true);
 }
 
 // Una richiesta di stato. Torna true se bisogna continuare a chiedere.
 static bool chiedi_stato_voce(char *risposta)
 {
-    if (adesso_ms() - voce_dal > ATTESA_VOCE_MAX_MS) { mostra_voce("Non aspetto piu': la risposta sara' nell'app", false); return false; }
+    if (adesso_ms() - voce_dal > ATTESA_VOCE_MAX_MS) { stato_voce("Non aspetto piu': la risposta sara' nell'app", false); return false; }
     char json[96];
     snprintf(json, sizeof json, "{\"t\":\"voce_stato\",\"id\":\"%.36s\"}", id_voce);
     ponte_esito_t e = ponte_scambia(json, risposta, RISPOSTA_VOCE_CAP);
     if (e != PONTE_OK) {
         if (++errori_voce < ERRORI_STATO_MAX) return true;
-        mostra_voce(ponte_esito_testo(e), true);
+        stato_voce(ponte_esito_testo(e), true);
         vibra(250);
         return false;
     }
@@ -719,6 +764,17 @@ static bool chiedi_stato_voce(char *risposta)
     cJSON *n = cJSON_GetObjectItemCaseSensitive(r, "nota");
     bool fine = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "fine"));
     bool con_risposta = cJSON_IsString(ri) && ri->valuestring[0];
+    const char *nota = cJSON_IsString(n) ? n->valuestring : "";
+    // Un passaggio intermedio (trascrivo, scelgo la conversazione, al lavoro...) non e' una risposta: va nella fascia di stato e
+    // l'ultima risposta resta dov'e' (26/11/2026). Solo se la nota e' troppo lunga per la fascia (una domanda del lavoro in
+    // corso) sostituisce il testo del pannello, come prima: altrimenti si perderebbe.
+    const bool in_fascia = !fine && nota[0] && strlen(nota) <= FASCIA_MAX_CAR;
+    if (!fine) riprova_voce = riprova_da(r);
+    if (in_fascia) {
+        stato_voce(nota, false);
+        cJSON_Delete(r);
+        return true;
+    }
     // File lasciati nello Scambio con la risposta: qui solo quanti sono, si aprono dal telefono.
     cJSON *f = cJSON_GetObjectItemCaseSensitive(r, "file");
     int n_file = cJSON_IsArray(f) ? cJSON_GetArraySize(f) : 0;
@@ -726,7 +782,7 @@ static bool chiedi_stato_voce(char *risposta)
     if (n_file > 0) snprintf(riga_file, sizeof riga_file, "\n\n%d file nello Scambio: aprili dal telefono", n_file);
     snprintf(schermo_voce, RISPOSTA_VOCE_CAP + 64, "%s%s%s%s%s",
              cJSON_IsString(t) ? "Tu: " : "", cJSON_IsString(t) ? t->valuestring : "", cJSON_IsString(t) ? "\n\n" : "",
-             con_risposta ? ri->valuestring : cJSON_IsString(n) ? n->valuestring : "", riga_file);
+             con_risposta ? ri->valuestring : nota, riga_file);
     // 26/11/2026: con la risposta pronta, e se il PC la ha letta e Silenzioso e' spento, la si ascolta dall'altoparlante.
     // Quando non si ascolta, lo schermo dice perche' (prima non diceva niente, e "il PC non la manda" non si distingueva da
     // "l'altoparlante e' muto").
@@ -739,15 +795,13 @@ static bool chiedi_stato_voce(char *risposta)
                            : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "audio")) ? "Silenzioso acceso nelle Impostazioni"
                            : "la voce non e' pronta sul PC";
         snprintf(schermo_voce + base, cap - base, "\n\n(senza voce: %s)", perche);
-        const size_t dopo = strlen(schermo_voce);
-        if (dopo + 2 < cap) {
-            schermo_voce[dopo] = '\n';
-            riga_tempi(schermo_voce + dopo + 1, cap - dopo - 1, false);
-        }
     }
     mostra_voce(schermo_voce, fine);
-    if (fine) { if (con_risposta) vibra_due(); else vibra(60); }
-    else riprova_voce = riprova_da(r);
+    if (fine) {
+        stato_voce("", false);   // la risposta e' arrivata: la fascia non ripete piu' "al lavoro..."
+        mostra_tempi(false);     // senza lo scarico: si aggiunge quando la voce e' scaricata (ascolta)
+        if (con_risposta) vibra_due(); else vibra(60);
+    }
     cJSON_Delete(r);
     if (parla) ascolta();
     return !fine;
@@ -763,7 +817,7 @@ static bool registra_e_manda(char *risposta)
         pcm = heap_caps_malloc(max * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (pcm) break;
     }
-    if (!pcm) { mostra_voce("Memoria insufficiente per registrare", true); vibra(250); return false; }
+    if (!pcm) { stato_voce("Memoria insufficiente per registrare", true); vibra(250); return false; }
     ponte_chiudi();   // i microfoni chiedono memoria interna (I2S, circa 17 KB): la connessione sicura non resta aperta durante la registrazione
     vibra(40);
     inizio_registrazione = adesso_ms();
@@ -773,19 +827,19 @@ static bool registra_e_manda(char *risposta)
         free(pcm);
         char riga[200];   // 27 di testo fisso + voce_errore (al massimo 159)
         snprintf(riga, sizeof riga, "Microfoni non disponibili:\n%s", voce_errore()[0] ? voce_errore() : "motivo sconosciuto");
-        mostra_voce(riga, true); vibra(250); return false;
+        stato_voce(riga, true); vibra(250); return false;
     }
-    if ((uint32_t)n * 1000u / VOCE_HZ < VOCE_MIN_MS) { free(pcm); mostra_voce("Troppo breve: tieni premuto BOOT mentre parli", true); return false; }
+    if ((uint32_t)n * 1000u / VOCE_HZ < VOCE_MIN_MS) { free(pcm); stato_voce("Troppo breve: tieni premuto BOOT mentre parli", true); return false; }
     char riga[80];
     snprintf(riga, sizeof riga, "Invio %ld s di audio...%s", n / VOCE_HZ, (size_t)n >= max ? "\n(durata massima raggiunta)" : "");
-    mostra_voce(riga, true);
+    stato_voce(riga, true);
     const uint32_t t_invio = adesso_ms();
     ponte_esito_t e = voce_spedisci(pcm, (size_t)n, risposta, RISPOSTA_VOCE_CAP);
     ms_invio = adesso_ms() - t_invio;
     ms_attesa = 0;
     ms_scarico = 0;
     free(pcm);
-    if (e != PONTE_OK) { mostra_voce(ponte_esito_testo(e), true); vibra(250); return false; }
+    if (e != PONTE_OK) { stato_voce(ponte_esito_testo(e), true); vibra(250); return false; }
     aggiorna_conferma();
     cJSON *r = cJSON_Parse(risposta);
     bool ok = r && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"));
@@ -803,7 +857,7 @@ static bool registra_e_manda(char *risposta)
     errori_voce = 0;
     char inviato[48];
     snprintf(inviato, sizeof inviato, "Inviato in %u,%u s. Trascrivo...", DECIMI(ms_invio));
-    mostra_voce(inviato, true);
+    stato_voce(inviato, true);
     vibra(60);
     return true;
 }
