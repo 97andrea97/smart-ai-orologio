@@ -605,7 +605,7 @@ static bool registra_e_manda(char *risposta)
     long n = voce_registra(pcm, max, continua_registrazione);
     if (n < 0) {
         free(pcm);
-        char riga[160];
+        char riga[200];   // 27 di testo fisso + voce_errore (al massimo 159)
         snprintf(riga, sizeof riga, "Microfoni non disponibili:\n%s", voce_errore()[0] ? voce_errore() : "motivo sconosciuto");
         mostra_voce(riga, true); vibra(250); return false;
     }

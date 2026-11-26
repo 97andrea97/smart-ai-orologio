@@ -26,13 +26,20 @@ static esp_codec_dev_handle_t altoparlante = NULL, microfoni = NULL;
 static int16_t grezzo[LETTURA_FRAME * POSTI_TDM];
 
 // 25/11/2026, prova sul vero: "Microfoni non disponibili" senza sapere dove. Il passo fallito e il motivo vanno a schermo
-// (voce_errore), con la memoria interna adatta al DMA ancora libera: niente cavo per capirlo.
-static char errore[96];
+// (voce_errore), con la memoria: niente cavo per capirlo.
+// 26/11/2026: oltre alla memoria interna adatta al DMA (l'I2S ne chiede circa 17 KB in 12 pezzi da 1-2 KB), il suo blocco
+// piu' grande, tutta la memoria interna e la PSRAM libere. Si misura dopo che il pacchetto della scheda ha gia' restituito
+// cio' che aveva preso: e' la memoria che c'era prima del tentativo.
+static char errore[160];
 const char *voce_errore(void) { return errore; }
 static void segna(const char *passo, esp_err_t e)
 {
-    snprintf(errore, sizeof errore, "%s: %s (DMA libera %u)", passo, e == ESP_OK ? "fallito" : esp_err_to_name(e),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    snprintf(errore, sizeof errore, "%s: %s\nDMA libera %u, blocco %u\ninterna %u, PSRAM %uk",
+             passo, e == ESP_OK ? "fallito" : esp_err_to_name(e),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     ESP_LOGE(TAG, "%s", errore);
 }
 
@@ -51,7 +58,7 @@ bool voce_avvia(void)
         altoparlante = microfoni = NULL;
         return false;
     }
-    ESP_LOGI(TAG, "microfoni pronti");
+    ESP_LOGI(TAG, "microfoni pronti, DMA libera dopo %u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
     return true;
 }
 
