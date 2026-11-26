@@ -55,3 +55,15 @@ CONFIG_MBEDTLS_HARDWARE_AES=n
 # piu' di 10 KB (IRAM_OPT) e piu' di 17 KB (RX_IRAM_OPT) di IRAM risparmiati, wifi un po' piu' lento. Lo schermo non cambia.
 CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# Microfoni, secondo giro (26/11/2026): con le due righe sopra l'errore e' rimasto. Causa: con la PSRAM, malloc() mette
+# prima nella memoria interna ogni richiesta fino a CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL byte (default 16384, Kconfig di
+# esp_psram v5.5.5) e passa alla PSRAM solo quando la interna e' finita: oggetti di LVGL (CONFIG_LV_USE_CLIB_MALLOC),
+# cJSON e client HTTP la riempiono tutta, qualunque cosa si liberi. Nemmeno la riserva per il DMA li ferma: ha anche
+# MALLOC_CAP_DEFAULT, quindi malloc() la usa quando il resto e' pieno (esp_psram_extram_reserve_dma_pool, esp_psram.c).
+# Con 0 malloc() va prima nella PSRAM e la memoria interna resta a chi la chiede esplicitamente (DMA dell'I2S, pile dei
+# compiti, wifi). E' il valore del firmware di fabbrica (examples/factory/sdkconfig.defaults di Waveshare). Lo schermo
+# non cambia: il pacchetto della scheda chiede il buffer di disegno esplicitamente DMA interno (buff_dma, non buff_spiram);
+# lo schermo verde visto con 0 il 25/11 era col pacchetto difettoso, che il disegno lo metteva nella PSRAM. La riserva per il DMA
+# resta al default (32768), piu' prudente dei 4096 del firmware di fabbrica.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
