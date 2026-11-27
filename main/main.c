@@ -663,6 +663,9 @@ static void dialogo(void *arg)
             // Nessun messaggio a schermo e nessuna vibrazione, nemmeno se non parte: non deve mai disturbare.
             ponte_manda(json, strlen(json), false, risposta, sizeof risposta);
         } else {
+            // La wifi non c'e' ancora (appena acceso, o caduta): lo scambio la aspetta fino a un minuto (rete.c), e intanto
+            // si dice. L'esito dello scambio, o il suo errore, prende poi il posto di questa riga.
+            if (rete_fase() == RETE_IN_COLLEGAMENTO) messaggio("Wifi in collegamento");
             ponte_esito_t e = ponte_scambia(json, risposta, sizeof risposta);
             if (e == PONTE_OK) {
                 aggiorna_conferma();   // il PC ha risposto: il programma nuovo funziona e resta
