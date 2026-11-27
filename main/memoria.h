@@ -35,3 +35,7 @@ int memoria_reti(rete_t reti[MAX_RETI]);
 // Aggiunge o sostituisce (stesso nome); false se sono gia' MAX_RETI e il nome e' nuovo.
 bool memoria_aggiungi_rete(const char *ssid, const char *password);
 bool memoria_togli_rete(const char *ssid);
+// L'ultima rete che ha dato un indirizzo (27/11/2026): all'accensione si prova per prima, se e' in vista (rete.c).
+// Si scrive solo quando cambia. false se non c'e' ancora.
+bool memoria_ultima_rete(char *ssid, size_t cap);
+void memoria_imposta_ultima_rete(const char *ssid);

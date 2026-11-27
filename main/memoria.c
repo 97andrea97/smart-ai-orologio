@@ -145,6 +145,17 @@ bool memoria_aggiungi_rete(const char *ssid, const char *password)
     return ok;
 }
 
+bool memoria_ultima_rete(char *ssid, size_t cap) { return leggi_testo("rete_ok", ssid, cap); }
+
+void memoria_imposta_ultima_rete(const char *ssid)
+{
+    nvs_handle_t h;
+    if (!apri(NVS_READWRITE, &h)) return;
+    nvs_set_str(h, "rete_ok", ssid);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 bool memoria_togli_rete(const char *ssid)
 {
     nvs_handle_t h;

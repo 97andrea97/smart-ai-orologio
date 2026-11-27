@@ -33,6 +33,10 @@ void rete_scansione_ferma(void);
 rete_fase_t rete_fase(void);
 const char *rete_nome(void);   // la rete a cui e' collegato o che sta provando, "" se nessuna
 bool rete_attendi(int ms);     // true se collegata entro ms
+// Scelta della rete (27/11/2026, rete.c): all'avvio e a ogni caduta una scansione, poi si provano solo le reti salvate
+// in vista, prima l'ultima che ha funzionato e poi dalla piu' forte. Uno scambio aspetta la wifi fino a un minuto;
+// ponte_esito_testo(PONTE_SENZA_RETE) dice "Nessuna rete wifi" solo se nessuna salvata e' in vista, altrimenti
+// "Wifi non collegato (codice N)". I rifiuti, contati per codice, vanno al PC come evento errore di origine "wifi".
 
 typedef enum {
     PONTE_OK = 0,

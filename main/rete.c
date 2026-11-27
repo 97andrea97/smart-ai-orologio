@@ -1,5 +1,6 @@
 #include "rete.h"
 #include "memoria.h"
+#include "telemetria.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,9 @@ static const char *TAG = "rete";
 // Quanto aspetta la risposta del PC a una richiesta, in tempo vero (dal 26/11/2026 conta anche la durata delle richieste:
 // prima contava solo le pause). Assoluto: e' il tempo che il PC ha per rispondere a una singola busta.
 #define ATTESA_RISPOSTA_MS 25000
+// Quanto uno scambio aspetta che la wifi si colleghi prima di arrendersi. Assoluto: una scansione (2-3 s) piu' un paio
+// di prove di collegamento; oltre un minuto chi guarda il polso ha gia' rinunciato.
+#define ATTESA_WIFI_MS     60000
 // Pausa fra due ritiri della risposta. Con la connessione riusata un ritiro costa una frazione di secondo, e il PC risponde
 // in poche decine di millisecondi: con i 500 ms fissi di prima la risposta arrivava quasi sempre al secondo ritiro, mezzo
 // secondo dopo. Si ritira presto (primo secondo), poi meno spesso: una risposta che tarda e' un lavoro lungo del PC.
@@ -135,25 +139,179 @@ static void prova_rete(int i)
     esp_wifi_connect();
 }
 
+// ---- scelta della rete (27/11/2026) ------------------------------------------------------------------
+// Prima le reti salvate si provavano alla cieca, in ordine fisso: con la rete buona in fondo all'elenco la wifi arrivava
+// a 27 e a 74 secondi dall'avvio, e lo sblocco scriveva "Nessuna rete wifi" con il segnale buono. Ora, all'avvio e ogni
+// volta che il collegamento cade o un giro di prove finisce, si fa una scansione e si provano solo le reti salvate in
+// vista: per prima l'ultima che ha funzionato (memoria permanente, memoria.c), poi le altre dalla piu' forte. Se nessuna
+// salvata e' in vista (o la scansione non parte) si fa un giro alla cieca come prima, cosi' una rete nascosta si collega
+// lo stesso, e poi si scandisce di nuovo. Con la schermata Wifi aperta (pausa) la scelta e' ferma.
+#define SCANSIONE_LETTE 32       // reti lette dal driver a ogni scansione, le piu' forti (assoluto: memoria)
+// Sotto questa forza l'ultima rete buona non ha la precedenza su una piu' forte. Assoluto, in dBm: attorno a -80 un
+// ESP32 si collega ancora ma perde spesso il collegamento (cautela nostra, da ritarare con la telemetria).
+#define SEGNALE_DEBOLE_DBM (-80)
+#define RIFIUTI_DISTINTI 4
+static uint8_t ordine[MAX_RETI];                 // indici in `reti`, nell'ordine in cui si provano in questo giro
+static int n_ordine = 0, i_ordine = 0;
+static volatile bool scelta_in_corso = false;    // la scansione in corso e' la nostra, non della schermata
+static volatile uint32_t scarta_fino = 0;        // fino a questo istante una fine scansione e' quella fermata da noi
+static volatile int viste_salvate = -1;          // reti salvate viste dall'ultima scansione; -1 = nessuna scansione riuscita
+static char ultima_buona[33];
+// I rifiuti dall'ultimo collegamento, per codice (wifi_err_reason_t): vanno al PC quando la wifi arriva (telemetria).
+static volatile int ultimo_rifiuto = 0;
+static struct { uint8_t codice, volte; } rifiuti[RIFIUTI_DISTINTI];
+static uint32_t rifiuti_totali = 0;
+
+static void segna_rifiuto(int perche)
+{
+    ultimo_rifiuto = perche;
+    rifiuti_totali++;
+    int libero = -1;
+    for (int i = 0; i < RIFIUTI_DISTINTI; i++) {
+        if (rifiuti[i].volte && rifiuti[i].codice == (uint8_t)perche) { if (rifiuti[i].volte < 255) rifiuti[i].volte++; return; }
+        if (!rifiuti[i].volte && libero < 0) libero = i;
+    }
+    if (libero >= 0) { rifiuti[libero].codice = (uint8_t)perche; rifiuti[libero].volte = 1; }
+}
+
+// Alla telemetria (evento errore, origine "wifi"): quanti rifiuti prima di collegarsi e con quali codici. Mai il nome della rete.
+static void racconta_rifiuti(void)
+{
+    if (rifiuti_totali == 0) return;
+    static char t[128];   // un chiamante per volta: con `scambio` preso
+    int n = snprintf(t, sizeof t, "collegata a %lu ms dopo %lu rifiuti, codici", (unsigned long)ora_ms(), (unsigned long)rifiuti_totali);
+    for (int i = 0; i < RIFIUTI_DISTINTI; i++) {
+        if (rifiuti[i].volte && n > 0 && n < (int)sizeof t) n += snprintf(t + n, sizeof t - n, " %ux%u", (unsigned)rifiuti[i].codice, (unsigned)rifiuti[i].volte);
+    }
+    if (n > 0 && n < (int)sizeof t) snprintf(t + n, sizeof t - n, ", salvate in vista %d di %d", viste_salvate, n_reti);
+    telemetria_errore("wifi", t);
+    memset(rifiuti, 0, sizeof rifiuti);
+    rifiuti_totali = 0;
+}
+
+// Dopo un collegamento riuscito: ricorda la rete (la memoria permanente si scrive solo se cambia) e manda i rifiuti al
+// PC. Il gestore degli eventi alza solo `collegata_da_registrare`: scrivere la memoria e comporre il testo li' dentro
+// peserebbe sulla pila del compito degli eventi (2304 byte di default). Lo fa ponte_manda, con `scambio` preso.
+static volatile bool collegata_da_registrare = false;
+static void registra_collegamento(void)
+{
+    if (n_reti > 0 && strcmp(ultima_buona, reti[rete_corrente].ssid) != 0) {
+        strncpy(ultima_buona, reti[rete_corrente].ssid, sizeof ultima_buona - 1);
+        ultima_buona[sizeof ultima_buona - 1] = 0;
+        memoria_imposta_ultima_rete(ultima_buona);
+    }
+    racconta_rifiuti();
+}
+
+// Fa partire la scansione che sceglie la rete. Se il driver non la fa partire, la prossima salvata a giro, come prima.
+static void avvia_scelta(void)
+{
+    if (n_reti == 0) { fase = RETE_NESSUNA_SALVATA; return; }
+    fase = RETE_IN_COLLEGAMENTO;
+    n_ordine = 0;
+    i_ordine = 0;
+    scelta_in_corso = true;
+    esp_err_t e = esp_wifi_scan_start(NULL, false);   // tutti i canali, senza aspettare: arriva WIFI_EVENT_SCAN_DONE
+    if (e == ESP_OK) return;
+    scelta_in_corso = false;
+    ESP_LOGW(TAG, "scansione di scelta non partita: %s", esp_err_to_name(e));
+    rete_corrente = (rete_corrente + 1) % n_reti;
+    prova_rete(rete_corrente);
+}
+
+// A scansione finita: mette in `ordine` le reti salvate in vista e prova la prima.
+static void scegli_e_prova(bool ok)
+{
+    int8_t forza[MAX_RETI] = { 0 };
+    bool vista[MAX_RETI] = { false };
+    uint16_t n = 0;
+    wifi_ap_record_t *ap = NULL;
+    if (ok) esp_wifi_scan_get_ap_num(&n);
+    if (n > SCANSIONE_LETTE) n = SCANSIONE_LETTE;
+    if (n > 0) {
+        ap = heap_caps_calloc(n, sizeof *ap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ap) ap = calloc(n, sizeof *ap);
+    }
+    if (ap && esp_wifi_scan_get_ap_records(&n, ap) == ESP_OK) {
+        for (int i = 0; i < n; i++) {
+            char nome[33];
+            memcpy(nome, ap[i].ssid, 32);
+            nome[32] = 0;
+            for (int j = 0; j < n_reti; j++) {
+                if (strcmp(reti[j].ssid, nome) != 0 || (vista[j] && ap[i].rssi <= forza[j])) continue;
+                vista[j] = true;
+                forza[j] = ap[i].rssi;
+            }
+        }
+    }
+    free(ap);
+    esp_wifi_clear_ap_list();   // libera la lista del driver anche quando non e' stata letta
+    if (n_reti == 0) { fase = RETE_NESSUNA_SALVATA; return; }
+
+    n_ordine = 0;
+    i_ordine = 0;
+    for (int j = 0; j < n_reti; j++) {
+        if (!vista[j]) continue;
+        const bool buona_j = strcmp(reti[j].ssid, ultima_buona) == 0 && forza[j] >= SEGNALE_DEBOLE_DBM;
+        int k = n_ordine++;
+        ordine[k] = (uint8_t)j;
+        while (k > 0) {   // risale: prima l'ultima buona, poi dalla piu' forte
+            const int p = ordine[k - 1];
+            const bool buona_p = strcmp(reti[p].ssid, ultima_buona) == 0 && forza[p] >= SEGNALE_DEBOLE_DBM;
+            if (buona_p || (!buona_j && forza[j] <= forza[p])) break;
+            ordine[k] = (uint8_t)p;
+            ordine[--k] = (uint8_t)j;
+        }
+    }
+    viste_salvate = ok ? n_ordine : -1;
+    if (n_ordine == 0) {   // nessuna salvata in vista: un giro alla cieca, dall'ultima buona
+        int primo = 0;
+        for (int j = 0; j < n_reti; j++) if (strcmp(reti[j].ssid, ultima_buona) == 0) primo = j;
+        for (int j = 0; j < n_reti; j++) ordine[n_ordine++] = (uint8_t)((primo + j) % n_reti);
+    }
+    rete_corrente = ordine[0];
+    ESP_LOGI(TAG, "scelta: %d salvate in vista su %d, provo %s", viste_salvate, n_reti, reti[rete_corrente].ssid);
+    prova_rete(rete_corrente);
+}
+
 static void evento(void *arg, esp_event_base_t base, int32_t id, void *dati)
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        if (n_reti > 0 && !pausa) prova_rete(rete_corrente);
+        if (n_reti > 0 && !pausa) avvia_scelta();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(eventi, BIT_COLLEGATA);
-        if (scollega_e_prova) { scollega_e_prova = false; prova_rete(rete_corrente); return; }
+        if (scollega_e_prova) { scollega_e_prova = false; n_ordine = 0; prova_rete(rete_corrente); return; }
+        const bool era_collegata = fase == RETE_COLLEGATA;
         int perche = dati ? ((wifi_event_sta_disconnected_t *)dati)->reason : 0;
-        // Il motivo del rifiuto va nel registro (Console di esptool-js): 15 = password sbagliata,
-        // 201 = rete non trovata, 210 = protezione non compatibile (codici wifi_err_reason_t di ESP-IDF).
+        // Il motivo del rifiuto va nel registro (Console di esptool-js) e, contato per codice, al PC: 15 = stretta di
+        // mano scaduta (di solito password sbagliata), 2 = autenticazione scaduta, 200 = rete persa, 201 = rete non
+        // trovata, 210 = protezione non compatibile (wifi_err_reason_t, esp_wifi_types_generic.h di ESP-IDF v5.5).
         if (dati) ESP_LOGW(TAG, "wifi rifiutato da %s, motivo %d", reti[rete_corrente].ssid, perche);
         if (provando_nuova) { provando_nuova = false; esito_nuova = perche > 0 ? perche : 1; }
         if (n_reti == 0) { fase = RETE_NESSUNA_SALVATA; return; }
         if (pausa) { fase = RETE_IN_COLLEGAMENTO; return; }   // si riprende all'uscita dalla schermata
-        rete_corrente = (rete_corrente + 1) % n_reti;   // la prossima rete salvata, a giro
-        prova_rete(rete_corrente);
+        if (scelta_in_corso) return;                           // la scansione di scelta e' gia' partita: decide lei
+        segna_rifiuto(perche);
+        // Un collegamento caduto, o il giro finito: si guarda di nuovo cosa c'e' in vista. Altrimenti la prossima del giro.
+        if (!era_collegata && i_ordine + 1 < n_ordine) {
+            rete_corrente = ordine[++i_ordine];
+            prova_rete(rete_corrente);
+        } else {
+            avvia_scelta();
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
-        scansione_ok = dati && ((wifi_event_sta_scan_done_t *)dati)->status == 0;
+        const bool ok = dati && ((wifi_event_sta_scan_done_t *)dati)->status == 0;
+        const uint32_t fino = scarta_fino;
+        scarta_fino = 0;
+        if (fino && (int32_t)(ora_ms() - fino) < 0) { esp_wifi_clear_ap_list(); return; }   // la nostra, fermata da rete_pausa
+        if (scelta_in_corso) {
+            scelta_in_corso = false;
+            if (pausa || fase == RETE_COLLEGATA) { esp_wifi_clear_ap_list(); return; }
+            scegli_e_prova(ok);
+            return;
+        }
+        scansione_ok = ok;
         scansione_finita = true;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         dns_di_ripiego();   // prima di dichiararsi collegata: il primo scambio ha gia' il secondo DNS
@@ -161,6 +319,7 @@ static void evento(void *arg, esp_event_base_t base, int32_t id, void *dati)
         fase = RETE_COLLEGATA;
         if (provando_nuova) { provando_nuova = false; esito_nuova = 0; }
         ESP_LOGI(TAG, "collegato a %s", reti[rete_corrente].ssid);
+        collegata_da_registrare = true;   // memoria permanente e telemetria: al primo scambio, non qui (pila piccola)
         xEventGroupSetBits(eventi, BIT_COLLEGATA);
     }
     (void)dati;
@@ -186,6 +345,7 @@ void rete_avvia(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));   // le reti stanno solo nel nostro spazio NVS
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     n_reti = memoria_reti(reti);
+    if (!memoria_ultima_rete(ultima_buona, sizeof ultima_buona)) ultima_buona[0] = 0;
     fase = n_reti ? RETE_IN_COLLEGAMENTO : RETE_NESSUNA_SALVATA;
     ESP_ERROR_CHECK(esp_wifi_start());
 }
@@ -194,6 +354,7 @@ void rete_ricarica(void)
 {
     n_reti = memoria_reti(reti);
     rete_corrente = 0;
+    n_ordine = 0;            // l'ordine di prima non vale piu': dopo questa prova si scandisce di nuovo
     esp_wifi_disconnect();   // l'evento di disconnessione fa ripartire il giro con le reti nuove
     if (n_reti == 0) fase = RETE_NESSUNA_SALVATA;
     else prova_rete(0);
@@ -207,12 +368,17 @@ void rete_pausa(bool si)
         provando_nuova = false;
         scollega_e_prova = false;
         pausa = true;
+        if (scelta_in_corso) {   // la nostra scansione si ferma: la sua fine (entro un secondo) non e' della schermata
+            scelta_in_corso = false;
+            scarta_fino = ora_ms() + 1000;
+            esp_wifi_scan_stop();
+        }
         if (fase != RETE_COLLEGATA) esp_wifi_disconnect();   // ferma il collegamento in corso; collegata, la scansione va
         return;
     }
     if (!pausa) return;   // dopo "Salva" il giro e' gia' ripartito
     pausa = false;
-    if (fase != RETE_COLLEGATA && n_reti > 0) prova_rete(rete_corrente);
+    if (fase != RETE_COLLEGATA && n_reti > 0) avvia_scelta();
 }
 
 void rete_ricarica_prima(const char *ssid)
@@ -220,6 +386,7 @@ void rete_ricarica_prima(const char *ssid)
     n_reti = memoria_reti(reti);
     rete_corrente = 0;
     for (int i = 0; i < n_reti; i++) if (strcmp(reti[i].ssid, ssid) == 0) rete_corrente = i;
+    n_ordine = 0;   // se la nuova non va, si scandisce e si sceglie fra le salvate
     esito_nuova = -1;
     provando_nuova = n_reti > 0;
     pausa = false;
@@ -257,7 +424,6 @@ void rete_scansione_ferma(void)
 
 // Al piu' SCANSIONE_LETTE reti dal driver, in PSRAM, liberate subito: nomi senza doppioni (resta il segnale piu' forte),
 // niente nomi vuoti (reti nascoste), le `max` piu' forti, dalla piu' forte.
-#define SCANSIONE_LETTE 32
 int rete_scansione_leggi(rete_vista_t *fuori, int max)
 {
     uint16_t n = 0;
@@ -476,12 +642,19 @@ static int chiama(const char *url, const char *gettone, esp_http_client_method_t
     return stato;
 }
 
+static char senza_rete[48];
+
 const char *ponte_esito_testo(ponte_esito_t e)
 {
     switch (e) {
         case PONTE_OK: return "ok";
         case PONTE_NON_ABBINATO: return "Orologio non abbinato";
-        case PONTE_SENZA_RETE: return "Nessuna rete wifi";
+        case PONTE_SENZA_RETE:
+            // "Nessuna rete wifi" solo se nessuna rete salvata e' in vista (27/11/2026); altrimenti il collegamento e' in
+            // corso o rifiutato, e si dice con che codice (wifi_err_reason_t), che cosi' arriva anche al PC.
+            if (n_reti == 0 || viste_salvate == 0 || (viste_salvate < 0 && ultimo_rifiuto == 201)) return "Nessuna rete wifi";
+            snprintf(senza_rete, sizeof senza_rete, "Wifi non collegato (codice %d)", ultimo_rifiuto);
+            return senza_rete;
         case PONTE_PC_SPENTO: return "Il PC non e' collegato";
         case PONTE_RIFIUTATO: return "Orologio non riconosciuto: va riabbinato";
         case PONTE_NESSUNA_RISPOSTA: return "Il PC non ha risposto";
@@ -508,9 +681,12 @@ ponte_esito_t ponte_manda(const char *json, size_t lung_json, bool attendi, char
     if (!memoria_ponte(base, sizeof base) || !memoria_gettone(gettone, sizeof gettone) || !memoria_chiave(chiave)) {
         return PONTE_NON_ABBINATO;
     }
-    if (!rete_attendi(20000)) return PONTE_SENZA_RETE;
+    // Senza reti salvate non c'e' niente da aspettare. Altrimenti fino a ATTESA_WIFI_MS: chi chiama scrive intanto
+    // "Wifi in collegamento" (main.c). Prima erano 20 s, e la wifi arrivava a 27 e a 74 s dall'avvio (27/11/2026).
+    if (fase == RETE_NESSUNA_SALVATA || !rete_attendi(ATTESA_WIFI_MS)) return PONTE_SENZA_RETE;
 
     xSemaphoreTake(scambio, portMAX_DELAY);
+    if (collegata_da_registrare) { collegata_da_registrare = false; registra_collegamento(); }
     motivo[0] = 0;
     memset(&misura, 0, sizeof misura);
     const uint32_t inizio = ora_ms();
