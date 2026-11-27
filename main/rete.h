@@ -18,6 +18,18 @@ void rete_statistiche(rete_statistiche_t *s);
 int rete_segnale(void);
 // Rilegge le reti salvate e ricomincia a collegarsi (dopo che la pagina ne ha aggiunta una).
 void rete_ricarica(void);
+// Schermata Wifi dell'orologio (27/11/2026, wifi_schermo.c). rete_pausa(true) ferma il giro fra le reti salvate (la
+// scansione fallisce mentre ne prova una), rete_pausa(false) lo fa ripartire. rete_ricarica_prima rilegge le reti salvate
+// e prova per prima `ssid`; rete_esito_nuova: -1 in corso, 0 collegata, altrimenti il motivo del rifiuto
+// (wifi_err_reason_t: 15 password sbagliata, 201 rete non trovata). Mai password qui.
+void rete_pausa(bool si);
+void rete_ricarica_prima(const char *ssid);
+int rete_esito_nuova(void);
+typedef struct { char ssid[33]; int8_t rssi; bool aperta; } rete_vista_t;
+bool rete_scansiona(void);                  // false se il driver non la fa partire (si riprova)
+bool rete_scansione_finita(bool *ok);
+int rete_scansione_leggi(rete_vista_t *fuori, int max);   // ordinate per segnale; libera la lista del driver
+void rete_scansione_ferma(void);
 rete_fase_t rete_fase(void);
 const char *rete_nome(void);   // la rete a cui e' collegato o che sta provando, "" se nessuna
 bool rete_attendi(int ms);     // true se collegata entro ms

@@ -114,12 +114,23 @@ static void dns_di_ripiego(void)
     if (e != ESP_OK) ESP_LOGW(TAG, "DNS di ripiego non impostato: %s", esp_err_to_name(e));
 }
 
+// Schermata Wifi dell'orologio (27/11/2026, wifi_schermo.c). Con la schermata aperta il giro di collegamento e' fermo
+// (pausa): mentre esp_wifi_connect prova una rete salvata che non c'e', la scansione fallisce. Dopo "Salva" si prova
+// per prima la rete nuova (rete_ricarica_prima) e il suo esito resta in esito_nuova: -1 in corso, 0 collegata,
+// altrimenti il motivo del rifiuto (wifi_err_reason_t). Le scrive il gestore degli eventi, le legge la schermata.
+static volatile bool pausa = false;
+static volatile bool scollega_e_prova = false;   // collegata a un'altra rete: si stacca, poi si prova la nuova
+static volatile bool provando_nuova = false;
+static volatile int esito_nuova = -1;
+static volatile bool scansione_finita = false, scansione_ok = false;
+
 static void prova_rete(int i)
 {
     wifi_config_t wc = { 0 };
     strncpy((char *)wc.sta.ssid, reti[i].ssid, sizeof wc.sta.ssid - 1);
     strncpy((char *)wc.sta.password, reti[i].password, sizeof wc.sta.password - 1);
     esp_wifi_set_config(WIFI_IF_STA, &wc);
+    memset(&wc, 0, sizeof wc);   // la password non resta nella pila
     fase = RETE_IN_COLLEGAMENTO;
     esp_wifi_connect();
 }
@@ -128,20 +139,27 @@ static void evento(void *arg, esp_event_base_t base, int32_t id, void *dati)
 {
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        if (n_reti > 0) prova_rete(rete_corrente);
+        if (n_reti > 0 && !pausa) prova_rete(rete_corrente);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(eventi, BIT_COLLEGATA);
+        if (scollega_e_prova) { scollega_e_prova = false; prova_rete(rete_corrente); return; }
+        int perche = dati ? ((wifi_event_sta_disconnected_t *)dati)->reason : 0;
         // Il motivo del rifiuto va nel registro (Console di esptool-js): 15 = password sbagliata,
         // 201 = rete non trovata, 210 = protezione non compatibile (codici wifi_err_reason_t di ESP-IDF).
-        if (dati) ESP_LOGW(TAG, "wifi rifiutato da %s, motivo %d", reti[rete_corrente].ssid,
-                           ((wifi_event_sta_disconnected_t *)dati)->reason);
+        if (dati) ESP_LOGW(TAG, "wifi rifiutato da %s, motivo %d", reti[rete_corrente].ssid, perche);
+        if (provando_nuova) { provando_nuova = false; esito_nuova = perche > 0 ? perche : 1; }
         if (n_reti == 0) { fase = RETE_NESSUNA_SALVATA; return; }
+        if (pausa) { fase = RETE_IN_COLLEGAMENTO; return; }   // si riprende all'uscita dalla schermata
         rete_corrente = (rete_corrente + 1) % n_reti;   // la prossima rete salvata, a giro
         prova_rete(rete_corrente);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        scansione_ok = dati && ((wifi_event_sta_scan_done_t *)dati)->status == 0;
+        scansione_finita = true;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         dns_di_ripiego();   // prima di dichiararsi collegata: il primo scambio ha gia' il secondo DNS
         if (statistiche.ms_wifi == 0) statistiche.ms_wifi = ora_ms();
         fase = RETE_COLLEGATA;
+        if (provando_nuova) { provando_nuova = false; esito_nuova = 0; }
         ESP_LOGI(TAG, "collegato a %s", reti[rete_corrente].ssid);
         xEventGroupSetBits(eventi, BIT_COLLEGATA);
     }
@@ -179,6 +197,111 @@ void rete_ricarica(void)
     esp_wifi_disconnect();   // l'evento di disconnessione fa ripartire il giro con le reti nuove
     if (n_reti == 0) fase = RETE_NESSUNA_SALVATA;
     else prova_rete(0);
+}
+
+// ---- schermata Wifi (wifi_schermo.c) ----------------------------------------------------------------
+
+void rete_pausa(bool si)
+{
+    if (si) {
+        provando_nuova = false;
+        scollega_e_prova = false;
+        pausa = true;
+        if (fase != RETE_COLLEGATA) esp_wifi_disconnect();   // ferma il collegamento in corso; collegata, la scansione va
+        return;
+    }
+    if (!pausa) return;   // dopo "Salva" il giro e' gia' ripartito
+    pausa = false;
+    if (fase != RETE_COLLEGATA && n_reti > 0) prova_rete(rete_corrente);
+}
+
+void rete_ricarica_prima(const char *ssid)
+{
+    n_reti = memoria_reti(reti);
+    rete_corrente = 0;
+    for (int i = 0; i < n_reti; i++) if (strcmp(reti[i].ssid, ssid) == 0) rete_corrente = i;
+    esito_nuova = -1;
+    provando_nuova = n_reti > 0;
+    pausa = false;
+    if (n_reti == 0) { fase = RETE_NESSUNA_SALVATA; return; }
+    if (fase == RETE_COLLEGATA) {
+        scollega_e_prova = true;   // l'evento di disconnessione prova la nuova
+        if (esp_wifi_disconnect() == ESP_OK) return;
+        scollega_e_prova = false;
+    }
+    prova_rete(rete_corrente);
+}
+
+int rete_esito_nuova(void) { return esito_nuova; }
+
+bool rete_scansiona(void)
+{
+    scansione_finita = false;
+    scansione_ok = false;
+    esp_err_t e = esp_wifi_scan_start(NULL, false);   // tutti i canali, senza aspettare: arriva WIFI_EVENT_SCAN_DONE
+    if (e != ESP_OK) ESP_LOGW(TAG, "scansione non partita: %s", esp_err_to_name(e));
+    return e == ESP_OK;
+}
+
+bool rete_scansione_finita(bool *ok)
+{
+    if (ok) *ok = scansione_ok;
+    return scansione_finita;
+}
+
+void rete_scansione_ferma(void)
+{
+    esp_wifi_scan_stop();
+    esp_wifi_clear_ap_list();   // la lista del driver occupa memoria fino alla prossima lettura
+}
+
+// Al piu' SCANSIONE_LETTE reti dal driver, in PSRAM, liberate subito: nomi senza doppioni (resta il segnale piu' forte),
+// niente nomi vuoti (reti nascoste), le `max` piu' forti, dalla piu' forte.
+#define SCANSIONE_LETTE 32
+int rete_scansione_leggi(rete_vista_t *fuori, int max)
+{
+    uint16_t n = 0;
+    int k = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n > SCANSIONE_LETTE) n = SCANSIONE_LETTE;
+    wifi_ap_record_t *ap = NULL;
+    if (n > 0) {
+        ap = heap_caps_calloc(n, sizeof *ap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ap) ap = calloc(n, sizeof *ap);
+    }
+    if (ap && esp_wifi_scan_get_ap_records(&n, ap) == ESP_OK) {
+        for (int i = 0; i < n; i++) {
+            char nome[33];
+            memcpy(nome, ap[i].ssid, 32);
+            nome[32] = 0;
+            if (!nome[0]) continue;
+            int j = 0;
+            while (j < k && strcmp(fuori[j].ssid, nome) != 0) j++;
+            if (j == k) {
+                if (k < max) k++;
+                else {   // pieno: si sostituisce la piu' debole, se questa e' piu' forte
+                    int d = 0;
+                    for (int m = 1; m < k; m++) if (fuori[m].rssi < fuori[d].rssi) d = m;
+                    if (ap[i].rssi <= fuori[d].rssi) continue;
+                    j = d;
+                }
+                strcpy(fuori[j].ssid, nome);
+            } else if (ap[i].rssi <= fuori[j].rssi) {
+                continue;
+            }
+            fuori[j].rssi = ap[i].rssi;
+            fuori[j].aperta = ap[i].authmode == WIFI_AUTH_OPEN;
+        }
+    }
+    free(ap);
+    esp_wifi_clear_ap_list();
+    for (int i = 1; i < k; i++) {   // dalla piu' forte
+        rete_vista_t v = fuori[i];
+        int j = i - 1;
+        while (j >= 0 && fuori[j].rssi < v.rssi) { fuori[j + 1] = fuori[j]; j--; }
+        fuori[j + 1] = v;
+    }
+    return k;
 }
 
 rete_fase_t rete_fase(void) { return fase; }
