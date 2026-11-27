@@ -9,7 +9,8 @@
 #include "esp_err.h"
 #include "esp_random.h"
 #include "esp_heap_caps.h"
-#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mbedtls/base64.h"
 #include "bsp/esp-bsp.h"
 
@@ -405,12 +406,12 @@ ponte_esito_t voce_giro_pezzo(voce_giro_t *g, const int16_t *pcm, size_t campion
     size_t scritti = 0;
     if (h < 0 || mbedtls_base64_encode((unsigned char *)g->json + h, g->cap_json - (size_t)h - 3, &scritti, dati, lung) != 0) return PONTE_ERRORE;
     memcpy(g->json + h + scritti, "\"}", 3);
-    const int64_t t0 = esp_timer_get_time();
+    const TickType_t t0 = xTaskGetTickCount();   // esp_timer non e' fra le dipendenze del componente (CMakeLists.txt)
     ponte_esito_t esito = ponte_manda(g->json, (size_t)h + scritti + 2, fine, risposta, cap);
     // Banda in salita: solo i pezzi intermedi (l'ultimo aspetta anche la risposta del PC).
     if (!fine && esito == PONTE_OK) {
         g->byte_inviati += (uint32_t)((size_t)h + scritti + 2);
-        g->ms_invio += (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        g->ms_invio += (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
     }
     if (esito != PONTE_OK) ESP_LOGW(TAG, "pezzo %d%s: %s", g->i + 1, fine ? " (ultimo)" : "", ponte_esito_testo(esito));
     else g->i++;
