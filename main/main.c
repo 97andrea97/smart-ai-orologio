@@ -670,17 +670,18 @@ static void rifiuto_voce(const char *motivo)
 
 // ---- risposta a voce (26/11/2026) -----------------------------------------------------------------------
 // Quando la risposta e' pronta e il PC dice "parla", l'orologio scarica la risposta letta dal PC (voce_audio, a pezzi da
-// VOCE_PEZZO_BYTE, PROTOCOLLO.md del PC) e la fa sentire dall'altoparlante. Prima scarica tutto e poi suona: niente
-// pause a meta' frase mentre arriva il pezzo dopo (costo: qualche secondo di attesa in piu'). BOOT o Chiudi la fermano;
+// VOCE_PEZZO_BYTE, PROTOCOLLO.md del PC) e la fa sentire dall'altoparlante. Dal 27/11/2026 suona mentre scarica (suonatore,
+// qui sotto): prima scaricava tutto e poi suonava, 38 s di attesa per 80 s di voce. BOOT o Chiudi la fermano;
 // BOOT tenuto giu' registra subito un messaggio nuovo (il giro di `parla` vede il tasto premuto).
 // ferma_ascolto e' dichiarato accanto a tocco_chiudi_voce, che lo accende.
-static bool ascolto_fermato = false;
+static volatile bool ascolto_fermato = false;   // volatile: lo accende anche il suonatore (27/11/2026)
 static unsigned secondi_voce = 0;   // lunghezza della risposta letta, per la riga che dice che ha suonato
 // Tempi dell'ultimo giro (26/11/2026: "dall'orologio e' molto piu' lento che dal telefono" andava misurato, non indovinato):
 // durata dell'invio dell'audio, attesa fra la fine dell'invio e la risposta, scaricamento della voce. Stanno sullo schermo, in
 // cima alla risposta, in secondi e decimi, e vanno al PC in millisecondi (telemetria.c) insieme alla durata dell'ascolto e a
 // quanto e' costata la rete nel giro.
 static uint32_t ms_invio = 0, ms_attesa = 0, ms_scarico = 0, ms_riproduzione = 0;
+static uint32_t ms_primo_suono = 0;   // dalla prima richiesta della voce all'apertura dell'altoparlante (27/11/2026)
 // Banda misurata (27/11/2026), in byte al secondo: in salita sui pezzi intermedi (byte della richiesta / durata), in discesa
 // sui pezzi della voce (byte in base64 / durata dello scaricamento). cod_giro: 0 PCM, 1 IMA ADPCM in salita (bit 0), in discesa (bit 1).
 static uint32_t bps_su = 0, bps_giu = 0, cod_giro = 0;
@@ -697,7 +698,7 @@ static void tempi_telemetria(int esito)
         .richieste = ora.richieste - rete_inizio_giro.richieste,
         .connessioni = ora.collegamenti - rete_inizio_giro.collegamenti,
         .apertura = ora.ms_apertura - rete_inizio_giro.ms_apertura,
-        .su = bps_su, .giu = bps_giu, .cod = cod_giro,
+        .su = bps_su, .giu = bps_giu, .cod = cod_giro, .primo_suono = ms_primo_suono,
     };
     telemetria_tempi(&t);
 }
@@ -727,6 +728,37 @@ static bool continua_ascolto(void)
     return true;
 }
 
+// ---- suono mentre scarica (27/11/2026) ---------------------------------------------------------------------
+// Misure del 27/11/2026: 30 pezzi IMA da circa 2,7 s di voce l'uno arrivano ciascuno in 1,0-1,5 s (il piu' lento 2,1 s), ma
+// il suono partiva solo dopo tutto lo scarico (37,6 s). Ora un compito piccolo, `suonatore`, suona `pcm` mentre
+// ascolta_risposta lo riempie; se raggiunge il punto scaricato suona silenzio finche' arriva altro (voce_riproduci).
+// Condivisi: flusso_pronti (campioni gia' in pcm, lo scrive solo chi scarica), flusso_finito (lo scarico non aggiunge piu'
+// niente), suonatore_chiuso (l'altoparlante e' chiuso: pcm si puo' liberare). Il tasto che ferma passa da continua_ascolto.
+// Il codec lo tocca solo il suonatore; chi scarica non lo tocca e, alla fine, aspetta suonatore_chiuso.
+// Anticipo: il suono parte con 5 s di voce gia' scaricati, cioe' dopo 2 pezzi IMA (2,7 s di voce l'uno). Rispetto al pezzo piu'
+// lento misurato (2,1 s di rete per 2,7 s di voce) la riserva cresce a ogni pezzo: una pausa serve solo se la rete rallenta
+// per piu' di 5 s di fila. Con il PCM del PC di prima i pezzi sono piu' grossi e le pause piu' probabili (silenzio, non rumore).
+#define ANTICIPO_CAMPIONI ((size_t)5 * VOCE_HZ)
+#define PILA_SUONATORE 4096   // memoria interna, come PILA_REGISTRATORE: voce_riproduci scrive da un buffer statico, il resto e' poco
+static volatile size_t flusso_pronti = 0;
+static volatile bool flusso_finito = false, suonatore_chiuso = false, suonatore_ok = false;
+static const int16_t *flusso_pcm = NULL;
+static size_t flusso_campioni = 0;
+static uint32_t flusso_t0 = 0;   // la prima richiesta della voce
+
+static void suonatore(void *arg)
+{
+    (void)arg;
+    const uint32_t t = adesso_ms();
+    ms_primo_suono = t - flusso_t0;
+    const bool ok = voce_riproduci(flusso_pcm, flusso_campioni, &flusso_pronti, &flusso_finito, continua_ascolto);
+    ms_riproduzione = adesso_ms() - t;
+    suonatore_ok = ok;
+    __sync_synchronize();
+    suonatore_chiuso = true;
+    vTaskDelete(NULL);
+}
+
 // Scarica e fa sentire la risposta di id_voce. NULL se e' andato tutto bene, altrimenti la riga per lo schermo.
 static const char *ascolta_risposta(void)
 {
@@ -745,8 +777,11 @@ static const char *ascolta_risposta(void)
     size_t per_pezzo = VOCE_PEZZO_BYTE / 2;   // campioni in un pezzo
     uint32_t byte_giu = 0;
     const uint32_t t_scarico = adesso_ms();
+    flusso_pronti = 0;
+    flusso_finito = suonatore_chiuso = suonatore_ok = false;
+    bool suona = false, provato = false;   // il suonatore e' partito; si e' gia' provato a crearlo
     for (size_t i = 0; i < pezzi && !esito; i++) {
-        if (ferma_ascolto || gpio_get_level(TASTO_BOOT) == 0) { ascolto_fermato = true; break; }
+        if (ferma_ascolto || ascolto_fermato || gpio_get_level(TASTO_BOOT) == 0) { ascolto_fermato = true; break; }
         char json[96];
         if (chiedi_ima) snprintf(json, sizeof json, "{\"t\":\"voce_audio\",\"id\":\"%.36s\",\"i\":%u,\"cod\":\"ima\"}", id_voce, (unsigned)i);
         else snprintf(json, sizeof json, "{\"t\":\"voce_audio\",\"id\":\"%.36s\",\"i\":%u}", id_voce, (unsigned)i);
@@ -794,23 +829,49 @@ static const char *ascolta_risposta(void)
                     || !voce_adpcm_decodifica(adpcm, scritti, attesi, pcm + da)) esito = "voce arrivata male";
             } else if (mbedtls_base64_decode((unsigned char *)(pcm + da), attesi * 2, &scritti, (const unsigned char *)p->valuestring,
                                              lung64) != 0 || scritti != attesi * 2) esito = "voce arrivata male";
+            if (!esito) {
+                __sync_synchronize();   // i campioni scritti prima del numero che li rende visibili al suonatore
+                flusso_pronti = da + attesi;
+            }
         }
         cJSON_Delete(r);
+        // Con l'anticipo pronto parte il suonatore (non all'ultimo pezzo: una risposta breve suona dopo lo scarico, come prima).
+        if (!esito && !provato && i + 1 < pezzi && flusso_pronti >= ANTICIPO_CAMPIONI) {
+            provato = true;
+            flusso_pcm = pcm;
+            flusso_campioni = campioni;
+            flusso_t0 = t_scarico;
+            secondi_voce = (unsigned)(campioni / VOCE_HZ);
+            suona = xTaskCreate(suonatore, "suona", PILA_SUONATORE, NULL, 6, NULL) == pdPASS;
+            if (!suona) ESP_LOGW(TAG, "voce: compito che suona non creato, suono dopo lo scarico");
+        }
     }
+    __sync_synchronize();
+    flusso_finito = true;   // oltre flusso_pronti non arriva piu' niente: il suonatore suona il resto e chiude
     ms_scarico = adesso_ms() - t_scarico;
     bps_giu = ms_scarico ? (uint32_t)((uint64_t)byte_giu * 1000u / ms_scarico) : 0;
     if (ima) cod_giro |= 2;
     free(adpcm);
     ponte_chiudi();   // finito col ponte: la connessione sicura non serve mentre suona, e cade da sola se si aspetta
     free(buf);   // prima di suonare: 256 KB di PSRAM tornano liberi
-    if (!esito && !ascolto_fermato && pcm) {
+    bool suonato = false;
+    if (suona) {
+        // pcm resta del suonatore finche' non ha chiuso l'altoparlante.
+        while (!suonatore_chiuso) vTaskDelay(pdMS_TO_TICKS(20));
+        __sync_synchronize();
+        suonato = suonatore_ok;
+    }
+    // Senza suonatore (risposta breve, compito non creato) o se non ha aperto l'altoparlante (con la connessione sicura
+    // aperta la memoria interna e' meno): si suona qui, a scarico finito e ponte chiuso, come prima del 27/11/2026.
+    if (!suonato && !esito && !ascolto_fermato && pcm) {
         secondi_voce = (unsigned)(campioni / VOCE_HZ);
         const uint32_t t_ascolto = adesso_ms();
-        const bool suonato = voce_riproduci(pcm, campioni, continua_ascolto);
+        ms_primo_suono = t_ascolto - t_scarico;
+        suonato = voce_riproduci(pcm, campioni, NULL, NULL, continua_ascolto);
         ms_riproduzione = adesso_ms() - t_ascolto;
         if (!suonato) esito = "altoparlante non disponibile";
-        else if (tagliata && !ascolto_fermato) esito = "voce tagliata: il resto e' nell'app";
     }
+    if (suonato && !esito && tagliata && !ascolto_fermato) esito = "voce tagliata: il resto e' nell'app";
     free(pcm);
     return esito;
 }
@@ -955,7 +1016,7 @@ static bool registra_e_manda(char *risposta)
     }
     if (!pcm) { errore_voce("voce", "Memoria insufficiente per registrare"); vibra(250); return false; }
     rete_statistiche(&rete_inizio_giro);   // da qui il giro: la rete che costa si legge per differenza (tempi_telemetria)
-    ms_riproduzione = 0;
+    ms_riproduzione = ms_primo_suono = 0;
     bps_su = bps_giu = 0;
     cod_giro = 0;
     rete_veloce(true);   // wifi senza risparmio fino alla fine del giro (27/11/2026, rete.h)

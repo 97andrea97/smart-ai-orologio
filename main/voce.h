@@ -77,7 +77,10 @@ void voce_giro_chiudi(voce_giro_t *g);
 // Fa sentire `pcm` (mono, VOCE_HZ, 16 bit) dall'altoparlante finche' continua() dice true. Stessa apertura del bus della
 // registrazione (uscita e microfoni insieme, come il firmware di fabbrica), con l'uscita accesa. false se non si apre
 // o non si scrive (il passo in voce_errore()).
-bool voce_riproduci(const int16_t *pcm, size_t campioni, bool (*continua)(void));
+// Suono mentre scarica (27/11/2026): con `pronti` si suonano solo i primi *pronti campioni (li aggiorna un altro compito) e,
+// raggiunti, silenzio finche' ne arrivano altri; con *finito vero non ne arrivano piu' e si chiude. NULL, NULL: tutto pronto.
+bool voce_riproduci(const int16_t *pcm, size_t campioni, const volatile size_t *pronti, const volatile bool *finito,
+                    bool (*continua)(void));
 // Prova dell'altoparlante (26/11/2026), indipendente da PC, wifi, ponte e sblocco: un tono di 1000 Hz per 1 s, generato qui,
 // con la stessa apertura del bus e lo stesso pilota di voce_riproduci. In `esito` (testo per lo schermo, su piu' righe) il
 // codice di ogni passo del pilota, il livello del piedino dell'amplificatore (PA) e alcuni registri del chip ES8311.

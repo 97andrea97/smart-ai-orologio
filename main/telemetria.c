@@ -28,7 +28,7 @@ typedef struct {
     char tipo;               // 'e' errore, 't' tempi, 'a' avvio
     char origine[12];
     char testo[MAX_TESTO];
-    uint32_t n[11];          // tempi: invio, attesa, scarico, riproduzione, esito, richieste, connessioni, apertura, su, giu, cod; avvio: wifi, rst, mem, blk
+    uint32_t n[12];          // tempi: invio, attesa, scarico, riproduzione, esito, richieste, connessioni, apertura, su, giu, cod, primo suono; avvio: wifi, rst, mem, blk
 } evento_t;
 
 static evento_t *eventi = NULL;
@@ -109,6 +109,7 @@ void telemetria_tempi(const telemetria_tempi_t *t)
     p->n[8] = t->su;
     p->n[9] = t->giu;
     p->n[10] = t->cod;
+    p->n[11] = t->primo_suono;
     xSemaphoreGive(blocco);
 }
 
@@ -153,10 +154,10 @@ static bool agg_testo(char *j, size_t cap, size_t *n, const char *s)
 static bool scrivi_evento(char *j, size_t cap, size_t *n, const evento_t *e)
 {
     if (e->tipo == 't') {
-        return agg(j, cap, n, "{\"k\":\"tempi\",\"u\":%lu,\"inv\":%lu,\"att\":%lu,\"sca\":%lu,\"rip\":%lu,\"es\":%lu,\"rich\":%lu,\"conn\":%lu,\"tls\":%lu,\"su\":%lu,\"giu\":%lu,\"cod\":%lu}",
+        return agg(j, cap, n, "{\"k\":\"tempi\",\"u\":%lu,\"inv\":%lu,\"att\":%lu,\"sca\":%lu,\"rip\":%lu,\"es\":%lu,\"rich\":%lu,\"conn\":%lu,\"tls\":%lu,\"su\":%lu,\"giu\":%lu,\"cod\":%lu,\"pri\":%lu}",
                    (unsigned long)e->u, (unsigned long)e->n[0], (unsigned long)e->n[1], (unsigned long)e->n[2], (unsigned long)e->n[3],
                    (unsigned long)e->n[4], (unsigned long)e->n[5], (unsigned long)e->n[6], (unsigned long)e->n[7],
-                   (unsigned long)e->n[8], (unsigned long)e->n[9], (unsigned long)e->n[10]);
+                   (unsigned long)e->n[8], (unsigned long)e->n[9], (unsigned long)e->n[10], (unsigned long)e->n[11]);
     }
     if (e->tipo == 'a') {
         return agg(j, cap, n, "{\"k\":\"avvio\",\"u\":%lu,\"wifi\":%lu,\"rst\":%lu,\"mem\":%lu,\"blk\":%lu}",

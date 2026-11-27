@@ -112,13 +112,15 @@ long voce_registra(int16_t *pcm, size_t max_campioni, bool (*continua)(void))
 // Risposta letta (26/11/2026). L'apertura e' quella di voce_registra, che sull'orologio funziona: uscita stereo a VOCE_HZ,
 // poi l'ingresso a 4 posti (non letto: i campioni in arrivo si perdono, come nel lettore del firmware di fabbrica, che
 // imposta sempre tutte e due le direzioni). Niente memoria nuova: il mono diventa stereo in `grezzo` (2 KB gia' riservati,
-// 512 frame), perche' registrare e ascoltare non succedono mai insieme (tutti e due li chiama solo il compito della voce).
+// 512 frame), perche' registrare e ascoltare non succedono mai insieme (dal 27/11/2026 la risposta la suona il compito
+// `suonatore` di main.c, ma solo mentre il compito della voce scarica e non registra).
 #define FRAME_USCITA (LETTURA_FRAME * POSTI_TDM / 2)
 // Silenzio in coda prima di chiudere: svuota i buffer DMA dell'uscita (6 x 240 frame, 60 ms a 24 kHz, I2S_CHANNEL_DEFAULT_CONFIG)
 // cosi' l'ultima parola non si taglia e non si ripete. Sei giri da 512 frame, circa 128 ms.
 #define GIRI_SILENZIO 6
 
-bool voce_riproduci(const int16_t *pcm, size_t campioni, bool (*continua)(void))
+bool voce_riproduci(const int16_t *pcm, size_t campioni, const volatile size_t *pronti, const volatile bool *finito,
+                    bool (*continua)(void))
 {
     if (!voce_avvia()) return false;
     esp_codec_dev_sample_info_t uscita = { .sample_rate = VOCE_HZ, .channel = 2, .bits_per_sample = 16 };
@@ -137,9 +139,34 @@ bool voce_riproduci(const int16_t *pcm, size_t campioni, bool (*continua)(void))
 
     size_t n = 0;
     bool ok = true;
+    bool attesa = false;    // l'ultimo blocco scritto era silenzio d'attesa (27/11/2026, suono mentre scarica)
+    int16_t ultimo = 0;     // l'ultimo campione suonato: il silenzio d'attesa scende da li', senza scalino (niente clic)
     while (n < campioni && continua()) {
-        size_t k = campioni - n < FRAME_USCITA ? campioni - n : FRAME_USCITA;
-        for (size_t f = 0; f < k; f++) grezzo[2 * f] = grezzo[2 * f + 1] = pcm[n + f];
+        size_t disp = campioni;
+        if (pronti) {
+            const bool fine = finito && *finito;   // letto prima di *pronti: se e' vero, *pronti e' gia' quello definitivo
+            __sync_synchronize();
+            disp = *pronti < campioni ? *pronti : campioni;
+            __sync_synchronize();   // il numero prima dei campioni che rende visibili
+            if (n >= disp && fine) break;   // lo scarico si e' fermato prima della fine: si suona solo cio' che e' arrivato
+        }
+        if (n >= disp) {
+            // Raggiunto il punto scaricato: silenzio, non il vecchio contenuto del DMA (rumore), finche' arriva altro.
+            for (size_t f = 0; f < FRAME_USCITA; f++)
+                grezzo[2 * f] = grezzo[2 * f + 1] = (int16_t)((int32_t)ultimo * (int32_t)(FRAME_USCITA - 1 - f) / (int32_t)FRAME_USCITA);
+            ultimo = 0;
+            attesa = true;
+            if (esp_codec_dev_write(altoparlante, grezzo, (int)sizeof grezzo) != ESP_CODEC_DEV_OK) { segna("scrittura", ESP_OK); ok = false; break; }
+            continue;
+        }
+        size_t k = disp - n < FRAME_USCITA ? disp - n : FRAME_USCITA;
+        for (size_t f = 0; f < k; f++) {
+            int32_t s = pcm[n + f];
+            if (attesa) s = s * (int32_t)f / (int32_t)k;   // dopo un'attesa la voce rientra dolcemente
+            grezzo[2 * f] = grezzo[2 * f + 1] = (int16_t)s;
+        }
+        attesa = false;
+        ultimo = grezzo[2 * (k - 1)];
         if (esp_codec_dev_write(altoparlante, grezzo, (int)(k * 4)) != ESP_CODEC_DEV_OK) { segna("scrittura", ESP_OK); ok = false; break; }
         n += k;
     }
