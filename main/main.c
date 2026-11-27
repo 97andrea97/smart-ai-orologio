@@ -33,6 +33,7 @@
 #include "batteria.h"
 #include "voce.h"
 #include "telemetria.h"
+#include "wifi_schermo.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "mbedtls/base64.h"
@@ -117,6 +118,8 @@ static uint32_t adesso_ms(void) { return (uint32_t)(xTaskGetTickCount() * portTI
 // telemetria (telemetria.c) aspetta che finisca, cosi' non apre connessioni mentre servono memoria e tempo ai microfoni e
 // all'altoparlante. Lo scrive solo il compito della voce (parla).
 static volatile bool voce_occupata = false;
+// Vero mentre si scarica un aggiornamento: la schermata Wifi (wifi_schermo.c) non si apre, fermerebbe la rete.
+static volatile bool scarico_in_corso = false;
 
 // ---- motorino --------------------------------------------------------------------------------------
 
@@ -387,6 +390,16 @@ static void tocco_aggiorna(lv_event_t *e)
     spedisci(json);
 }
 
+// Schermata Wifi (27/11/2026, wifi_schermo.c): aggiungere una rete senza cavo. Mai mentre la voce lavora (registra, attende o
+// suona la risposta) o si scarica un aggiornamento: ferma il giro della wifi. Callback di LVGL: blocco gia' preso.
+static void tocco_wifi(lv_event_t *e)
+{
+    (void)e;
+    if (voce_occupata || scarico_in_corso) { vibra(250); lv_label_set_text(etichetta_messaggio, "Wifi: aspetta che finisca"); return; }
+    vibra(30);
+    wifi_schermo_apri();
+}
+
 static lv_obj_t *bottone(lv_obj_t *genitore, const char *testo, lv_event_cb_t cb)
 {
     lv_obj_t *b = lv_button_create(genitore);
@@ -430,6 +443,19 @@ static void disegna(void)
     lv_label_set_text(prova_testo, "Prova suono");
     lv_obj_set_style_text_font(prova_testo, &lv_font_montserrat_16, 0);
     lv_obj_center(prova_testo);
+
+    // Wifi (27/11/2026): in alto a destra, specchio di Prova suono, sempre in vista (anche bloccato e non abbinato: fuori
+    // casa serve proprio quando non c'e' rete). Apre la schermata per aggiungere una rete (wifi_schermo.c).
+    lv_obj_t *wifi = lv_button_create(schermo);
+    lv_obj_set_size(wifi, 124, 46);
+    lv_obj_align(wifi, LV_ALIGN_TOP_RIGHT, -10, 38);
+    lv_obj_set_style_radius(wifi, 23, 0);
+    lv_obj_set_style_bg_color(wifi, lv_color_hex(0x1E4B5E), 0);
+    lv_obj_add_event_cb(wifi, tocco_wifi, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *wifi_testo = lv_label_create(wifi);
+    lv_label_set_text(wifi_testo, "Wifi");
+    lv_obj_set_style_text_font(wifi_testo, &lv_font_montserrat_16, 0);
+    lv_obj_center(wifi_testo);
 
     etichetta_messaggio = lv_label_create(schermo);
     lv_obj_set_width(etichetta_messaggio, 370);
@@ -554,7 +580,9 @@ static void aggiorna_da(cJSON *r, bool ok, const char *motivo)
     }
     messaggio("Scarico l'aggiornamento...");
     ponte_chiudi();   // lo scaricamento apre la sua connessione, e la memoria (AES, PSRAM) e' scarsa (LEZIONI_OROLOGIO.md)
+    scarico_in_corso = true;
     aggiorna_esito_t e = aggiorna_scarica(u->valuestring, (size_t)d->valuedouble, s->valuestring, avanzamento);
+    scarico_in_corso = false;
     if (e != AGGIORNA_OK) { errore_msg("aggiorna", aggiorna_esito_testo(e)); vibra(250); return; }
     messaggio("Aggiornato e verificato: riavvio");
     vibra_due();
@@ -1239,6 +1267,7 @@ static void parla(void *arg)
             continue;
         }
         // Nessun caso muto (25/11/2026): ogni pressione da' un segno, anche quando non si puo' registrare.
+        if (wifi_schermo_aperto()) { vibra(250); continue; }   // la schermata Wifi ha fermato la rete: prima si chiude
         if (!memoria_abbinato()) { messaggio("Voce: orologio non abbinato al PC"); vibra(250); continue; }
         if (!sbloccato) { messaggio("Disegna il gesto, poi tieni premuto BOOT per parlare"); continue; }
         // Un messaggio nuovo smette di seguire il precedente: la sua risposta resta nell'app.
