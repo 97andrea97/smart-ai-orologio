@@ -521,12 +521,22 @@ static void aggiorna_da(cJSON *r, bool ok, const char *motivo)
     esp_restart();
 }
 
+// Audio leggero (27/11/2026): il PC annuncia `"cod":"ima"` nelle risposte a sblocca, stato, voce_stato e all'ultimo pezzo. Si
+// legge solo da quelle (il servizio nuovo lo mette sempre): se manca, il servizio e' quello di prima e si torna al PCM.
+static void leggi_cod(const cJSON *r)
+{
+    const cJSON *c = cJSON_GetObjectItemCaseSensitive(r, "cod");
+    voce_pc_ima = cJSON_IsString(c) && strcmp(c->valuestring, "ima") == 0;
+}
+
 static void gestisci_risposta(const char *inviato, const char *testo)
 {
     cJSON *r = cJSON_Parse(testo);
     bool ok = r && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"));
     cJSON *m = r ? cJSON_GetObjectItemCaseSensitive(r, "motivo") : NULL;
     const char *motivo = cJSON_IsString(m) ? m->valuestring : "";
+    // Risposta a sblocca o stato (ha "scade"): dice se il PC sa leggere l'audio leggero (27/11/2026).
+    if (ok && cJSON_GetObjectItemCaseSensitive(r, "scade")) leggi_cod(r);
     char riga[96];
 
     if (strstr(inviato, "\"sblocca\"")) {
@@ -671,6 +681,9 @@ static unsigned secondi_voce = 0;   // lunghezza della risposta letta, per la ri
 // cima alla risposta, in secondi e decimi, e vanno al PC in millisecondi (telemetria.c) insieme alla durata dell'ascolto e a
 // quanto e' costata la rete nel giro.
 static uint32_t ms_invio = 0, ms_attesa = 0, ms_scarico = 0, ms_riproduzione = 0;
+// Banda misurata (27/11/2026), in byte al secondo: in salita sui pezzi intermedi (byte della richiesta / durata), in discesa
+// sui pezzi della voce (byte in base64 / durata dello scaricamento). cod_giro: 0 PCM, 1 IMA ADPCM in salita (bit 0), in discesa (bit 1).
+static uint32_t bps_su = 0, bps_giu = 0, cod_giro = 0;
 static rete_statistiche_t rete_inizio_giro;   // la rete al momento di premere BOOT: la differenza e' il costo del giro
 #define DECIMI(ms) (unsigned)((ms) / 1000), (unsigned)(((ms) % 1000) / 100)
 
@@ -684,6 +697,7 @@ static void tempi_telemetria(int esito)
         .richieste = ora.richieste - rete_inizio_giro.richieste,
         .connessioni = ora.collegamenti - rete_inizio_giro.collegamenti,
         .apertura = ora.ms_apertura - rete_inizio_giro.ms_apertura,
+        .su = bps_su, .giu = bps_giu, .cod = cod_giro,
     };
     telemetria_tempi(&t);
 }
@@ -723,11 +737,19 @@ static const char *ascolta_risposta(void)
     bool tagliata = false;
     const char *esito = NULL;
     ascolto_fermato = false;
+    // Audio leggero (27/11/2026): se il PC l'ha annunciato si chiede la voce in IMA ADPCM, a pezzi da 2 s (un ottavo dei byte
+    // del PCM da 4 s); il PC di prima ignora la richiesta e manda PCM come sempre (la risposta senza "cod").
+    const bool chiedi_ima = voce_pc_ima;
+    bool ima = false;
+    uint8_t *adpcm = NULL;
+    size_t per_pezzo = VOCE_PEZZO_BYTE / 2;   // campioni in un pezzo
+    uint32_t byte_giu = 0;
     const uint32_t t_scarico = adesso_ms();
     for (size_t i = 0; i < pezzi && !esito; i++) {
         if (ferma_ascolto || gpio_get_level(TASTO_BOOT) == 0) { ascolto_fermato = true; break; }
         char json[96];
-        snprintf(json, sizeof json, "{\"t\":\"voce_audio\",\"id\":\"%.36s\",\"i\":%u}", id_voce, (unsigned)i);
+        if (chiedi_ima) snprintf(json, sizeof json, "{\"t\":\"voce_audio\",\"id\":\"%.36s\",\"i\":%u,\"cod\":\"ima\"}", id_voce, (unsigned)i);
+        else snprintf(json, sizeof json, "{\"t\":\"voce_audio\",\"id\":\"%.36s\",\"i\":%u}", id_voce, (unsigned)i);
         // Un pezzo perso si chiede ancora una volta, poi si rinuncia (il testo e' gia' a schermo).
         ponte_esito_t e = PONTE_ERRORE;
         for (int t = 0; t < 2 && e != PONTE_OK; t++) e = ponte_scambia(json, buf, RISPOSTA_AUDIO_CAP);
@@ -748,23 +770,37 @@ static const char *ascolta_risposta(void)
             if (!cJSON_IsNumber(hz) || hz->valueint != VOCE_HZ || c < 1 || c > (double)VOCE_MAX_S * VOCE_HZ || !cJSON_IsNumber(np)) {
                 esito = "voce in un formato sconosciuto";
             } else {
+                cJSON *cod = cJSON_GetObjectItemCaseSensitive(r, "cod");
+                ima = chiedi_ima && cJSON_IsString(cod) && strcmp(cod->valuestring, "ima") == 0;
+                per_pezzo = ima ? VOCE_AUDIO_ADPCM_CAMPIONI : VOCE_PEZZO_BYTE / 2;
                 campioni = (size_t)c;
-                pezzi = (campioni * 2 + VOCE_PEZZO_BYTE - 1) / VOCE_PEZZO_BYTE;
+                pezzi = (campioni + per_pezzo - 1) / per_pezzo;
                 tagliata = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "tagliata"));
                 if ((size_t)np->valueint != pezzi) esito = "voce in un formato sconosciuto";
                 else if (!(pcm = (int16_t *)heap_caps_malloc(campioni * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))) esito = "voce non scaricata: PSRAM piena";
+                else if (ima && !(adpcm = heap_caps_malloc(VOCE_ADPCM_BYTE(VOCE_AUDIO_ADPCM_CAMPIONI), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))) esito = "voce non scaricata: PSRAM piena";
             }
         }
         if (!esito) {
-            const size_t da = i * VOCE_PEZZO_BYTE;
-            const size_t attesi = campioni * 2 - da < VOCE_PEZZO_BYTE ? campioni * 2 - da : VOCE_PEZZO_BYTE;
+            const size_t da = i * per_pezzo;
+            const size_t attesi = campioni - da < per_pezzo ? campioni - da : per_pezzo;
+            const size_t lung64 = strlen(p->valuestring);
             size_t scritti = 0;
-            if (mbedtls_base64_decode((unsigned char *)pcm + da, attesi, &scritti, (const unsigned char *)p->valuestring,
-                                      strlen(p->valuestring)) != 0 || scritti != attesi) esito = "voce arrivata male";
+            byte_giu += (uint32_t)lung64;
+            if (ima) {
+                cJSON *nn = cJSON_GetObjectItemCaseSensitive(r, "n");
+                if (!cJSON_IsNumber(nn) || nn->valuedouble != (double)attesi
+                    || mbedtls_base64_decode(adpcm, VOCE_ADPCM_BYTE(VOCE_AUDIO_ADPCM_CAMPIONI), &scritti, (const unsigned char *)p->valuestring, lung64) != 0
+                    || !voce_adpcm_decodifica(adpcm, scritti, attesi, pcm + da)) esito = "voce arrivata male";
+            } else if (mbedtls_base64_decode((unsigned char *)(pcm + da), attesi * 2, &scritti, (const unsigned char *)p->valuestring,
+                                             lung64) != 0 || scritti != attesi * 2) esito = "voce arrivata male";
         }
         cJSON_Delete(r);
     }
     ms_scarico = adesso_ms() - t_scarico;
+    bps_giu = ms_scarico ? (uint32_t)((uint64_t)byte_giu * 1000u / ms_scarico) : 0;
+    if (ima) cod_giro |= 2;
+    free(adpcm);
     ponte_chiudi();   // finito col ponte: la connessione sicura non serve mentre suona, e cade da sola se si aspetta
     free(buf);   // prima di suonare: 256 KB di PSRAM tornano liberi
     if (!esito && !ascolto_fermato && pcm) {
@@ -817,6 +853,7 @@ static bool chiedi_stato_voce(char *risposta)
     aggiorna_conferma();
     cJSON *r = cJSON_Parse(risposta);
     bool ok = r && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"));
+    if (ok) leggi_cod(r);
     if (!ok) {
         cJSON *m = r ? cJSON_GetObjectItemCaseSensitive(r, "motivo") : NULL;
         rifiuto_voce(cJSON_IsString(m) ? m->valuestring : "risposta non valida");
@@ -919,6 +956,9 @@ static bool registra_e_manda(char *risposta)
     if (!pcm) { errore_voce("voce", "Memoria insufficiente per registrare"); vibra(250); return false; }
     rete_statistiche(&rete_inizio_giro);   // da qui il giro: la rete che costa si legge per differenza (tempi_telemetria)
     ms_riproduzione = 0;
+    bps_su = bps_giu = 0;
+    cod_giro = 0;
+    rete_veloce(true);   // wifi senza risparmio fino alla fine del giro (27/11/2026, rete.h)
     ponte_chiudi();   // i microfoni chiedono memoria interna (I2S, circa 17 KB): la connessione sicura non resta aperta durante la registrazione
     vibra(40);
     inizio_registrazione = adesso_ms();
@@ -943,6 +983,7 @@ static bool registra_e_manda(char *risposta)
         if (flusso && pronti >= inviati + pezzo_min + riserva) {
             size_t lung = pronti - riserva - inviati;
             if (lung > pezzo_max) lung = pezzo_max;
+            if (giro.ima) lung -= lung % 3;   // 24 -> 16 kHz senza salti fra un pezzo e l'altro
             if (voce_giro_pezzo(&giro, pcm + inviati, lung, false, risposta, RISPOSTA_VOCE_CAP) == PONTE_OK) inviati += lung;
             else flusso = false;   // il resto al rilascio, tutto da capo (ripiego)
             continue;
@@ -972,7 +1013,7 @@ static bool registra_e_manda(char *risposta)
         for (;;) {
             size_t lung = (size_t)n - inviati;
             const bool fine = lung <= pezzo_max;
-            if (!fine) lung = pezzo_max;
+            if (!fine) lung = pezzo_max;   // multiplo di 3 (VOCE_PEZZO_BYTE / 2 = 96 000)
             e = voce_giro_pezzo(&giro, pcm + inviati, lung, fine, risposta, RISPOSTA_VOCE_CAP);
             if (e != PONTE_OK) { if (!fine) intero = true; break; }
             inviati += lung;
@@ -980,6 +1021,8 @@ static bool registra_e_manda(char *risposta)
         }
         if (e == PONTE_OK && risposta_incompleta(risposta)) intero = true;
     }
+    bps_su = giro.ms_invio ? (uint32_t)((uint64_t)giro.byte_inviati * 1000u / giro.ms_invio) : 0;
+    cod_giro = giro.ima ? 1 : 0;
     voce_giro_chiudi(&giro);
     if (intero) {
         if (gia_partiti > 0) ESP_LOGW(TAG, "voce: ripiego, tutto da capo dopo %u campioni partiti mentre registrava", (unsigned)gia_partiti);
@@ -996,6 +1039,7 @@ static bool registra_e_manda(char *risposta)
     aggiorna_conferma();
     cJSON *r = cJSON_Parse(risposta);
     bool ok = r && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"));
+    if (ok) leggi_cod(r);
     cJSON *id = r ? cJSON_GetObjectItemCaseSensitive(r, "id") : NULL;
     if (!ok || !cJSON_IsString(id)) {
         cJSON *m = r ? cJSON_GetObjectItemCaseSensitive(r, "motivo") : NULL;
@@ -1078,7 +1122,7 @@ static void parla(void *arg)
             if (segui && (int32_t)(adesso_ms() - prossima) >= 0) {
                 segui = chiedi_stato_voce(risposta);
                 prossima = adesso_ms() + riprova_voce;
-                if (!segui) ponte_chiudi();   // niente piu' da chiedere: la connessione al ponte si chiude
+                if (!segui) { ponte_chiudi(); rete_veloce(false); }   // niente piu' da chiedere: connessione chiusa, wifi in risparmio
             }
             ponte_pulisci();   // e se e' rimasta aperta da troppo (un altro compito l'ha usata), si chiude qui
             continue;
@@ -1088,6 +1132,7 @@ static void parla(void *arg)
         if (!sbloccato) { messaggio("Disegna il gesto, poi tieni premuto BOOT per parlare"); continue; }
         // Un messaggio nuovo smette di seguire il precedente: la sua risposta resta nell'app.
         segui = registra_e_manda(risposta);   // voce_occupata resta vero: e' stato scritto alla pressione di BOOT
+        if (!segui) rete_veloce(false);
         prima = leggi_boot();
         prossima = adesso_ms() + riprova_voce;
         memset(risposta, 0, RISPOSTA_VOCE_CAP);

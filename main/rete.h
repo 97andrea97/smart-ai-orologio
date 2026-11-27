@@ -45,3 +45,6 @@ const char *ponte_esito_testo(ponte_esito_t e);
 // ponte_pulisci la chiude solo se ferma da troppo e senza aspettare (si chiama a ogni giro dal compito che la usa).
 void ponte_chiudi(void);
 void ponte_pulisci(void);
+
+// Wifi senza risparmio energetico (true) durante un giro di voce, poi di nuovo col risparmio di default (false).
+void rete_veloce(bool si);

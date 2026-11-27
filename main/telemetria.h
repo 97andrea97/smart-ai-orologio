@@ -29,6 +29,8 @@ typedef struct {
     uint32_t richieste;      // richieste fatte al ponte nel giro
     uint32_t connessioni;    // connessioni sicure aperte da zero nel giro
     uint32_t apertura;       // millisecondi spesi ad aprirle (DNS, TCP, stretta di mano TLS)
+    uint32_t su, giu;        // banda misurata in salita e in discesa, byte al secondo (0 se non misurata; 27/11/2026)
+    uint32_t cod;            // audio leggero: bit 0 in salita, bit 1 in discesa (0 = PCM)
 } telemetria_tempi_t;
 
 // Prepara la coda (nella PSRAM). Da chiamare una volta, prima dei compiti che la usano. Senza memoria la telemetria resta spenta.

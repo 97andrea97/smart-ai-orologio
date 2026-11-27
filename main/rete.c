@@ -457,3 +457,13 @@ fine:
     xSemaphoreGive(scambio);
     return esito;
 }
+
+// Wifi senza risparmio energetico durante un giro di voce (27/11/2026, STATO.md del PC "Audio leggero e rete dell'orologio").
+// Col risparmio di default (WIFI_PS_MIN_MODEM) la radio dorme fra un beacon e l'altro e le conferme TCP del ponte arrivano a
+// scatti di circa 100-300 ms: con una finestra di pochi KB la banda resta a decine di KB/s. Costa un po' di batteria solo
+// mentre il giro dura.
+void rete_veloce(bool si)
+{
+    const esp_err_t e = esp_wifi_set_ps(si ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    if (e != ESP_OK) ESP_LOGW(TAG, "risparmio wifi %s: %s", si ? "spento" : "acceso", esp_err_to_name(e));
+}

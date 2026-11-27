@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_random.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "mbedtls/base64.h"
 #include "bsp/esp-bsp.h"
 
@@ -265,12 +266,111 @@ bool voce_prova_suono(char *esito, size_t cap)
     return ok;
 }
 
+// ---- audio leggero: IMA ADPCM (27/11/2026) -------------------------------------------------------------------
+// Lo stesso algoritmo e le stesse tabelle di pc/adpcm.mjs (prove/prova_adpcm.mjs del PC confronta le tabelle). Formato di un
+// pezzo: primo campione int16 little endian, indice del passo (0-88), 0, poi un nibble per campione dal secondo, prima il basso.
+static const int16_t ADPCM_PASSI[] = {
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060,
+    1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484,
+    7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+};
+static const int8_t ADPCM_SALTI[] = { -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8 };
+volatile bool voce_pc_ima = false;
+
+static inline int stringi(int v, int a, int b) { return v < a ? a : v > b ? b : v; }
+
+static uint8_t adpcm_codifica_uno(int *pred, int *ind, int s)
+{
+    int passo = ADPCM_PASSI[*ind];
+    int diff = s - *pred;
+    uint8_t cod = 0;
+    if (diff < 0) { cod = 8; diff = -diff; }
+    int vp = passo >> 3;
+    if (diff >= passo) { cod |= 4; diff -= passo; vp += passo; }
+    passo >>= 1;
+    if (diff >= passo) { cod |= 2; diff -= passo; vp += passo; }
+    passo >>= 1;
+    if (diff >= passo) { cod |= 1; vp += passo; }
+    *pred = stringi(cod & 8 ? *pred - vp : *pred + vp, -32768, 32767);
+    *ind = stringi(*ind + ADPCM_SALTI[cod], 0, 88);
+    return cod;
+}
+
+static int adpcm_decodifica_uno(int *pred, int *ind, uint8_t cod)
+{
+    const int passo = ADPCM_PASSI[*ind];
+    int vp = passo >> 3;
+    if (cod & 4) vp += passo;
+    if (cod & 2) vp += passo >> 1;
+    if (cod & 1) vp += passo >> 2;
+    *pred = stringi(cod & 8 ? *pred - vp : *pred + vp, -32768, 32767);
+    *ind = stringi(*ind + ADPCM_SALTI[cod], 0, 88);
+    return *pred;
+}
+
+// n campioni -> VOCE_ADPCM_BYTE(n) byte in `d`. `ind` entra con l'indice di partenza ed esce con quello finale.
+static size_t adpcm_codifica(const int16_t *x, size_t n, uint8_t *ind, uint8_t *d)
+{
+    if (n == 0) return 0;
+    const size_t lung = VOCE_ADPCM_BYTE(n);
+    memset(d, 0, lung);
+    int pred = x[0], i = *ind;
+    d[0] = (uint8_t)(pred & 0xFF);
+    d[1] = (uint8_t)((pred >> 8) & 0xFF);
+    d[2] = (uint8_t)i;
+    for (size_t k = 1; k < n; k++) {
+        const uint8_t c = adpcm_codifica_uno(&pred, &i, x[k]);
+        d[4 + ((k - 1) >> 1)] |= ((k - 1) & 1) ? (uint8_t)(c << 4) : c;
+    }
+    *ind = (uint8_t)i;
+    return lung;
+}
+
+bool voce_adpcm_decodifica(const uint8_t *d, size_t lung, size_t n, int16_t *pcm)
+{
+    if (n < 1 || lung != VOCE_ADPCM_BYTE(n) || d[2] > 88 || d[3] != 0) return false;
+    int pred = (int16_t)((uint16_t)d[0] | ((uint16_t)d[1] << 8)), i = d[2];
+    pcm[0] = (int16_t)pred;
+    for (size_t k = 1; k < n; k++) {
+        const uint8_t b = d[4 + ((k - 1) >> 1)];
+        pcm[k] = (int16_t)adpcm_decodifica_uno(&pred, &i, ((k - 1) & 1) ? (uint8_t)(b >> 4) : (uint8_t)(b & 15));
+    }
+    return true;
+}
+
+// 24 -> 16 kHz: filtro [1 2 1]/4 (toglie quasi tutto sopra 8 kHz, che a 16 kHz tornerebbe come fruscio), poi due campioni
+// ogni tre (il primo e la media fra il secondo e il terzo). Se il pezzo comincia a un multiplo di 3 fra pezzi non ci sono salti.
+static inline int32_t filtro(const int16_t *x, size_t n, size_t i)
+{
+    const int32_t a = x[i ? i - 1 : i], c = x[i + 1 < n ? i + 1 : i];
+    return (a + 2 * (int32_t)x[i] + c) / 4;
+}
+static size_t riduci(const int16_t *x, size_t n, int16_t *y)
+{
+    size_t m = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        y[m++] = (int16_t)filtro(x, n, i);
+        if (i + 1 < n) y[m++] = (int16_t)((filtro(x, n, i + 1) + filtro(x, n, i + 2 < n ? i + 2 : i + 1)) / 2);
+    }
+    return m;
+}
+
 bool voce_giro_apri(voce_giro_t *g)
 {
+    memset(g, 0, sizeof *g);
     // Il pezzo in base64 (4 caratteri ogni 3 byte) dentro il JSON; nella PSRAM, come la busta (rete.c).
     g->cap_json = 4 * ((VOCE_PEZZO_BYTE + 2) / 3) + 160;
     g->json = heap_caps_malloc(g->cap_json, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!g->json) { ESP_LOGE(TAG, "memoria per il pezzo"); return false; }
+    // ADPCM solo se il PC l'ha annunciato; senza PSRAM per i due buffer, PCM come prima.
+    if (voce_pc_ima) {
+        const size_t max = (VOCE_PEZZO_BYTE / 2) * 2 / 3 + 1;
+        g->ridotto = heap_caps_malloc(max * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        g->adpcm = heap_caps_malloc(VOCE_ADPCM_BYTE(max), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        g->ima = g->ridotto && g->adpcm;
+        if (!g->ima) { free(g->ridotto); free(g->adpcm); g->ridotto = NULL; g->adpcm = NULL; ESP_LOGW(TAG, "ADPCM: PSRAM, mando PCM"); }
+    }
     snprintf(g->r, sizeof g->r, "%08lx", (unsigned long)esp_random());   // id della registrazione, non un segreto
     g->i = 0;
     return true;
@@ -279,20 +379,39 @@ bool voce_giro_apri(voce_giro_t *g)
 void voce_giro_chiudi(voce_giro_t *g)
 {
     free(g->json);
+    free(g->ridotto);
+    free(g->adpcm);
     g->json = NULL;
+    g->ridotto = NULL;
+    g->adpcm = NULL;
 }
 
 ponte_esito_t voce_giro_pezzo(voce_giro_t *g, const int16_t *pcm, size_t campioni, bool fine, char *risposta, size_t cap)
 {
-    const size_t lung = campioni * 2;
+    size_t lung = campioni * 2;
     if (!g->json || lung == 0 || lung > VOCE_PEZZO_BYTE) return PONTE_ERRORE;
-    int h = snprintf(g->json, g->cap_json, "{\"t\":\"voce\",\"r\":\"%s\",\"i\":%d,\"fine\":%s,\"hz\":%d,\"pcm\":\"",
+    const unsigned char *dati = (const unsigned char *)pcm;
+    int h;
+    if (g->ima) {
+        const size_t n = riduci(pcm, campioni, g->ridotto);
+        lung = adpcm_codifica(g->ridotto, n, &g->ind, g->adpcm);
+        dati = g->adpcm;
+        h = snprintf(g->json, g->cap_json, "{\"t\":\"voce\",\"r\":\"%s\",\"i\":%d,\"fine\":%s,\"hz\":%d,\"cod\":\"ima\",\"n\":%u,\"pcm\":\"",
+                     g->r, g->i, fine ? "true" : "false", VOCE_ADPCM_HZ, (unsigned)n);
+    } else {
+        h = snprintf(g->json, g->cap_json, "{\"t\":\"voce\",\"r\":\"%s\",\"i\":%d,\"fine\":%s,\"hz\":%d,\"pcm\":\"",
                      g->r, g->i, fine ? "true" : "false", VOCE_HZ);
+    }
     size_t scritti = 0;
-    if (h < 0 || mbedtls_base64_encode((unsigned char *)g->json + h, g->cap_json - (size_t)h - 3, &scritti,
-                                       (const unsigned char *)pcm, lung) != 0) return PONTE_ERRORE;
+    if (h < 0 || mbedtls_base64_encode((unsigned char *)g->json + h, g->cap_json - (size_t)h - 3, &scritti, dati, lung) != 0) return PONTE_ERRORE;
     memcpy(g->json + h + scritti, "\"}", 3);
+    const int64_t t0 = esp_timer_get_time();
     ponte_esito_t esito = ponte_manda(g->json, (size_t)h + scritti + 2, fine, risposta, cap);
+    // Banda in salita: solo i pezzi intermedi (l'ultimo aspetta anche la risposta del PC).
+    if (!fine && esito == PONTE_OK) {
+        g->byte_inviati += (uint32_t)((size_t)h + scritti + 2);
+        g->ms_invio += (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    }
     if (esito != PONTE_OK) ESP_LOGW(TAG, "pezzo %d%s: %s", g->i + 1, fine ? " (ultimo)" : "", ponte_esito_testo(esito));
     else g->i++;
     return esito;

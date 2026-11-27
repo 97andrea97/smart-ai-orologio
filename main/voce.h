@@ -45,12 +45,29 @@ ponte_esito_t voce_spedisci(const int16_t *pcm, size_t campioni, char *risposta,
 // pezzi piu' piccoli al rilascio resta meno audio ma ogni pezzo costa una richiesta (e un contatore salvato).
 #define VOCE_FLUSSO_MIN_MS 1000
 #define VOCE_FLUSSO_RISERVA_MS 100
-// Un giro di pezzi: stesso id `r`, indice che cresce, JSON nella PSRAM.
+// Audio leggero (27/11/2026, STATO.md del PC "Audio leggero e rete dell'orologio", PROTOCOLLO.md "Audio leggero"): IMA ADPCM
+// a 4 bit, un quarto del PCM. In salita l'audio passa anche da 24 a 16 kHz (quanto basta alla trascrizione): circa 8 KB/s
+// invece di 48. Si usa solo se il PC l'ha annunciato (`"cod":"ima"` in una sua risposta): voce_pc_ima.
+#define VOCE_ADPCM_HZ 16000
+// Pezzo della risposta letta in ADPCM: 2 s (VOCE_OROLOGIO_AUDIO_PEZZO_CAMPIONI_ADPCM in pc/regole.mjs, letto dalla prova).
+#define VOCE_AUDIO_ADPCM_CAMPIONI (2 * VOCE_HZ)
+// Byte ADPCM di n campioni: 4 di intestazione (primo campione, indice del passo, 0) piu' mezzo byte per ogni altro campione.
+#define VOCE_ADPCM_BYTE(n) ((n) == 0 ? 0 : 4 + (n) / 2)
+extern volatile bool voce_pc_ima;
+// Decodifica un pezzo ADPCM di `n` campioni in `pcm`. false se la lunghezza o l'intestazione non tornano.
+bool voce_adpcm_decodifica(const uint8_t *dati, size_t lung, size_t n, int16_t *pcm);
+// Un giro di pezzi: stesso id `r`, indice che cresce, JSON nella PSRAM. Con `ima` i pezzi partono in ADPCM a VOCE_ADPCM_HZ;
+// i pezzi intermedi devono allora avere un numero di campioni multiplo di 3 (24 -> 16 kHz senza salti fra i pezzi).
 typedef struct {
     char r[9];
     int i;
     char *json;
     size_t cap_json;
+    bool ima;
+    uint8_t ind;          // indice del passo ADPCM alla fine del pezzo prima
+    uint8_t *adpcm;       // pezzo codificato, nella PSRAM
+    int16_t *ridotto;     // pezzo a 16 kHz, nella PSRAM
+    uint32_t byte_inviati, ms_invio;   // per la banda in salita (telemetria)
 } voce_giro_t;
 // Prepara un giro (id nuovo, JSON per un pezzo da VOCE_PEZZO_BYTE nella PSRAM). false se manca la memoria.
 bool voce_giro_apri(voce_giro_t *g);
